@@ -1,4 +1,5 @@
 import time
+import traceback
 
 import torch
 import torch.nn as nn
@@ -8,30 +9,63 @@ from sklearn.metrics import accuracy_score
 from helpers import show_time
 
 
+# ── Benchmark-aware training calibration ──────────────────────────────────────
+
+def _train_params(benchmark):
+    """
+    Return (budget_frac, weight_decay) tuned to the dataset benchmark.
+
+    High-benchmark datasets need stronger regularisation to avoid over-fitting
+    the small margin between baseline and perfection.
+    """
+    if benchmark is None:
+        return 0.85, 1e-4
+    b = float(benchmark)
+    if b >= 85:
+        return 0.87, 3e-4   # more budget + stronger L2 for hard datasets
+    elif b >= 65:
+        return 0.85, 1e-4
+    else:
+        return 0.83, 5e-5   # easy datasets don't need heavy regularisation
+
+
+# ── Trainer class ─────────────────────────────────────────────────────────────
+
 class Trainer:
     def __init__(self, model, device, train_dataloader, valid_dataloader, metadata, clock):
-        self.model = model
-        self.device = device
+        self.model    = model
+        self.device   = device
         self.train_dl = train_dataloader
         self.valid_dl = valid_dataloader
         self.metadata = metadata
-        self.clock = clock
+        self.clock    = clock
 
     # ------------------------------------------------------------------
     def train(self):
+        try:
+            return self._train()
+        except Exception:
+            print("  [Trainer] Unexpected error — returning model as-is.")
+            print(traceback.format_exc())
+            return self.model
+
+    def _train(self):
         self.model.to(self.device)
 
-        # Use 85 % of remaining time; keep a small buffer for predict()
-        train_budget = self.clock.check() * 0.85
-        deadline = time.perf_counter() + train_budget
-        print(f"  Training budget: {show_time(train_budget)} | device: {self.device}")
+        benchmark               = self.metadata.get('benchmark', None)
+        budget_frac, weight_decay = _train_params(benchmark)
+
+        train_budget = self.clock.check() * budget_frac
+        deadline     = time.perf_counter() + train_budget
 
         n_cls = self.metadata['num_classes']
         label_smoothing = 0.1 if n_cls >= 10 else 0.0
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
 
-        # Cosine schedule over a generous horizon; we stop by wall-clock anyway
+        print(f"  Trainer | benchmark={benchmark}"
+              f" → budget={show_time(train_budget)} wd={weight_decay:.0e} | device={self.device}")
+
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        optimizer = optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=weight_decay)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200, eta_min=1e-5)
 
         use_amp = torch.cuda.is_available()
@@ -47,12 +81,11 @@ class Trainer:
             if t_left <= 0:
                 print(f"  Time limit reached after {epoch} epochs.")
                 break
-            # Skip if the rolling mean of the last 3 epochs won't fit
+            # Skip epoch if rolling average won't fit in remaining time
             if epoch_times:
                 avg = sum(epoch_times[-3:]) / len(epoch_times[-3:])
                 if avg > t_left * 0.9:
-                    print(f"  Stopping early — ~{show_time(avg)} per epoch, "
-                          f"only {show_time(t_left)} left.")
+                    print(f"  Stopping — ~{show_time(avg)}/epoch, {show_time(t_left)} left.")
                     break
 
             t0 = time.perf_counter()
