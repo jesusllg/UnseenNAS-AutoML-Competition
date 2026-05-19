@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+Download the 13 practice datasets for the NAS Unseen-Data Competition.
+
+Datasets are hosted on:
+  - Newcastle University Data Repository (figshare): 11 datasets
+  - University of Edinburgh DataShare:               2 datasets (Cryptic, Windspeed)
+
+After running, datasets land in:
+  datasets/
+    AddNIST/   train_x.npy  train_y.npy  valid_x.npy  valid_y.npy
+               test_x.npy   test_y.npy   metadata
+    CIFARTile/ ...
+    ...
+
+Usage:
+  python download_datasets.py                          # all 13
+  python download_datasets.py AddNIST CIFARTile        # selected
+  python download_datasets.py --list                   # show registry
+  python download_datasets.py --out path/to/datasets   # custom output dir
+"""
+
+import argparse
+import io
+import json
+import os
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Dataset registry
+# ---------------------------------------------------------------------------
+# Newcastle (figshare) datasets: downloaded as a ZIP via ndownloader.
+# Edinburgh DataShare datasets: follow DOI redirect to find the download.
+# ---------------------------------------------------------------------------
+
+DATASETS = {
+    "AddNIST":     {"host": "ncl", "ncl_id": 24574354, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.24574354.v1"},
+    "Language":    {"host": "ncl", "ncl_id": 24574729, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.24574729.v1"},
+    "MultNIST":    {"host": "ncl", "ncl_id": 24574678, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.24574678.v1"},
+    "CIFARTile":   {"host": "ncl", "ncl_id": 24551539, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.24551539.v1"},
+    "Gutenberg":   {"host": "ncl", "ncl_id": 24574753, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.24574753.v1"},
+    "GeoClassing": {"host": "ncl", "ncl_id": 24050256, "version": 3,
+                    "doi": "https://doi.org/10.25405/data.ncl.24050256.v3"},
+    "Chesseract":  {"host": "ncl", "ncl_id": 24118743, "version": 2,
+                    "doi": "https://doi.org/10.25405/data.ncl.24118743.v2"},
+    "Sudoku":      {"host": "ncl", "ncl_id": 26976121, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.26976121.v1"},
+    "Voxel":       {"host": "ncl", "ncl_id": 26970223, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.26970223.v1"},
+    "Myofibre":    {"host": "ncl", "ncl_id": 26969998, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.26969998.v1"},
+    "GameOfLife":  {"host": "ncl", "ncl_id": 30000835, "version": 1,
+                    "doi": "https://doi.org/10.25405/data.ncl.30000835"},
+    "Cryptic":     {"host": "edinburgh", "ncl_id": None, "version": 1,
+                    "doi": "https://doi.org/10.7488/ds/8054"},
+    "Windspeed":   {"host": "edinburgh", "ncl_id": None, "version": 1,
+                    "doi": "https://doi.org/10.7488/ds/8053"},
+}
+
+NCL_ZIP_URL = "https://data.ncl.ac.uk/ndownloader/articles/{ncl_id}/versions/{version}"
+
+REQUIRED_FILES = {
+    "train_x.npy", "train_y.npy",
+    "valid_x.npy", "valid_y.npy",
+    "test_x.npy",  "test_y.npy",
+    "metadata",
+}
+
+
+# ---------------------------------------------------------------------------
+# Download helpers
+# ---------------------------------------------------------------------------
+
+def _make_session():
+    try:
+        import requests
+        s = requests.Session()
+        s.headers["User-Agent"] = "NAS-Competition-Downloader/1.0"
+        return s, "requests"
+    except ImportError:
+        return None, "urllib"
+
+
+def _download_bytes(url, session, label=""):
+    """Download url → bytes with a live progress counter."""
+    chunk = 1 << 20  # 1 MB chunks
+
+    if session is not None:
+        resp = session.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+        buf, received = io.BytesIO(), 0
+        for data in resp.iter_content(chunk_size=chunk):
+            buf.write(data)
+            received += len(data)
+            _progress(label, received, total)
+        print()
+        return buf.getvalue()
+
+    else:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "NAS-Competition-Downloader/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            buf, received = io.BytesIO(), 0
+            while True:
+                data = resp.read(chunk)
+                if not data:
+                    break
+                buf.write(data)
+                received += len(data)
+                _progress(label, received, total)
+            print()
+            return buf.getvalue()
+
+
+def _progress(label, received, total):
+    mb = received / (1 << 20)
+    if total:
+        pct = received / total * 100
+        bar_w = 30
+        filled = int(bar_w * received / total)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        print(f"\r  {label}: [{bar}] {pct:5.1f}%  {mb:6.1f} MB", end="", flush=True)
+    else:
+        print(f"\r  {label}: {mb:6.1f} MB downloaded…", end="", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Per-host download strategies
+# ---------------------------------------------------------------------------
+
+def _download_ncl(name, info, dest_dir, session):
+    url = NCL_ZIP_URL.format(ncl_id=info["ncl_id"], version=info["version"])
+    print(f"  URL: {url}")
+    raw = _download_bytes(url, session, label=name)
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        members = zf.namelist()
+        for member in members:
+            fname = Path(member).name
+            if fname in REQUIRED_FILES or fname.endswith(".npy"):
+                zf.extract(member, dest_dir)
+                extracted = dest_dir / member
+                final = dest_dir / fname
+                if extracted != final:
+                    final.parent.mkdir(parents=True, exist_ok=True)
+                    extracted.rename(final)
+
+    # Clean up any subdirectories left behind by the ZIP
+    for item in dest_dir.iterdir():
+        if item.is_dir():
+            for sub in item.iterdir():
+                sub.rename(dest_dir / sub.name)
+            item.rmdir()
+
+
+def _download_edinburgh(name, info, dest_dir, session):
+    """
+    Edinburgh DataShare uses DSpace. We follow the DOI redirect to find the
+    dataset page, then look for a zip download link.
+    """
+    doi_url = info["doi"]
+    print(f"  Following DOI: {doi_url}")
+
+    try:
+        if session is not None:
+            resp = session.get(doi_url, timeout=30, allow_redirects=True)
+            resp.raise_for_status()
+            final_url = resp.url
+            html = resp.text
+        else:
+            import urllib.request
+            req = urllib.request.Request(
+                doi_url, headers={"User-Agent": "NAS-Competition-Downloader/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                final_url = r.url
+                html = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        _manual_fallback(name, info, str(e))
+        return False
+
+    # Look for a direct .zip download link in the HTML
+    import re
+    zip_links = re.findall(r'href="([^"]+\.zip)"', html)
+    if not zip_links:
+        zip_links = re.findall(r'href="([^"]+/bitstream/[^"]+)"', html)
+
+    if not zip_links:
+        _manual_fallback(name, info, "could not find zip link on page")
+        return False
+
+    from urllib.parse import urljoin
+    zip_url = urljoin(final_url, zip_links[0])
+    print(f"  Found zip: {zip_url}")
+    raw = _download_bytes(zip_url, session, label=name)
+
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for member in zf.namelist():
+            fname = Path(member).name
+            if fname in REQUIRED_FILES or fname.endswith(".npy"):
+                data = zf.read(member)
+                (dest_dir / fname).write_bytes(data)
+
+    return True
+
+
+def _manual_fallback(name, info, reason):
+    print(f"\n  ⚠  Could not auto-download {name}: {reason}")
+    print(f"     Please download manually from: {info['doi']}")
+    print(f"     Then unzip into:  datasets/{name}/")
+    print(f"     Required files: {', '.join(sorted(REQUIRED_FILES))}\n")
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+def _verify(name, dataset_dir):
+    missing = REQUIRED_FILES - {f.name for f in dataset_dir.iterdir()}
+    if missing:
+        print(f"  ⚠  {name}: missing files: {', '.join(sorted(missing))}")
+        return False
+
+    meta_path = dataset_dir / "metadata"
+    try:
+        meta = json.loads(meta_path.read_text())
+        needed = {"num_classes", "input_shape", "codename"}
+        if not needed.issubset(meta.keys()):
+            print(f"  ⚠  {name}: metadata missing keys: {needed - meta.keys()}")
+            return False
+    except Exception as e:
+        print(f"  ⚠  {name}: metadata unreadable: {e}")
+        return False
+
+    print(f"  ✓  {name}: OK  (codename={meta['codename']!r}"
+          f"  classes={meta['num_classes']}  shape={meta['input_shape']})")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download NAS competition practice datasets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("datasets", nargs="*",
+                        help="Dataset names to download (default: all).")
+    parser.add_argument("--list", action="store_true",
+                        help="List available datasets and exit.")
+    parser.add_argument("--out", default="datasets",
+                        help="Output directory (default: datasets/).")
+    parser.add_argument("--skip-existing", action="store_true", default=True,
+                        help="Skip datasets that already look complete.")
+    args = parser.parse_args()
+
+    if args.list:
+        print("Available datasets:")
+        for name, info in DATASETS.items():
+            print(f"  {name:<14} {info['doi']}")
+        return
+
+    targets = args.datasets if args.datasets else list(DATASETS.keys())
+    unknown = set(targets) - set(DATASETS.keys())
+    if unknown:
+        print(f"Unknown datasets: {', '.join(sorted(unknown))}")
+        print(f"Valid names: {', '.join(DATASETS.keys())}")
+        sys.exit(1)
+
+    out_root = Path(args.out)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    session, backend = _make_session()
+    print(f"HTTP backend: {backend}")
+    print(f"Output dir:   {out_root.resolve()}\n")
+
+    results = {}
+    for name in targets:
+        info = DATASETS[name]
+        dest = out_root / name
+        dest.mkdir(parents=True, exist_ok=True)
+
+        # Skip if already complete
+        if args.skip_existing:
+            existing = {f.name for f in dest.iterdir()} if dest.exists() else set()
+            if REQUIRED_FILES.issubset(existing):
+                print(f"[{name}] already present — skipping. (delete folder to re-download)")
+                results[name] = True
+                continue
+
+        print(f"\n[{name}]  ({info['host'].upper()}  DOI: {info['doi']})")
+        t0 = time.time()
+        try:
+            if info["host"] == "ncl":
+                _download_ncl(name, info, dest, session)
+                ok = _verify(name, dest)
+            else:
+                ok = _download_edinburgh(name, info, dest, session)
+                if ok:
+                    ok = _verify(name, dest)
+        except Exception as e:
+            _manual_fallback(name, info, str(e))
+            ok = False
+
+        elapsed = time.time() - t0
+        results[name] = ok
+        status = "✓" if ok else "✗"
+        print(f"  {status} {name} in {elapsed:.1f}s")
+
+    # Summary
+    print("\n" + "=" * 50)
+    print("Summary:")
+    ok_count = sum(results.values())
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'}  {name}")
+    print(f"\n{ok_count}/{len(results)} datasets ready.")
+    if ok_count < len(results):
+        print("\nFor failed datasets, download manually from the DOI links above")
+        print("and unzip into datasets/<DatasetName>/ with the required files.")
+
+
+if __name__ == "__main__":
+    main()
