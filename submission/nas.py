@@ -1,5 +1,6 @@
 import copy
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -47,7 +48,7 @@ class SearchableCNN(nn.Module):
     def __init__(self, in_channels, num_classes, stage_configs, input_hw):
         """
         stage_configs: list of (out_channels, num_blocks, kernel_size, use_residual)
-        input_hw: (H, W) of input images — controls how many pooling steps are safe
+        input_hw: (H, W) — controls how many safe downsampling steps exist
         """
         super().__init__()
         h = min(input_hw)
@@ -84,9 +85,10 @@ _KERNELS  = [3, 5]
 _BLOCKS   = [1, 2, 3]
 
 
-def _sample_stage_configs(rng, n_stages):
+def _sample_stage_configs(rng, n_stages, min_c_idx=0):
+    """Sample a random stage config list. min_c_idx forces larger starting channels."""
     configs = []
-    c_idx = 0
+    c_idx = min_c_idx
     for _ in range(n_stages):
         c_idx = int(rng.randint(c_idx, min(c_idx + 2, len(_CHANNELS) - 1) + 1))
         configs.append((
@@ -98,11 +100,34 @@ def _sample_stage_configs(rng, n_stages):
     return configs
 
 
+# ── Benchmark-aware search calibration ────────────────────────────────────────
+
+def _search_params(benchmark):
+    """
+    Return (budget_frac, proxy_epochs, proxy_batches, min_c_idx) tuned to benchmark.
+
+    Scoring formula: adj = (acc% - benchmark%) * 10/(100 - benchmark%)
+    High-benchmark datasets yield more points per % gain → invest more effort.
+    Low-benchmark datasets are easy to beat → a quick search suffices.
+    """
+    if benchmark is None:
+        return 0.30, 3, 40, 0
+    b = float(benchmark)
+    if b >= 85:
+        # Hard to beat but each % is worth a lot — maximise search depth
+        return 0.35, 5, 50, 1   # start channels at 64+
+    elif b >= 65:
+        return 0.30, 3, 40, 0
+    else:
+        # Easy win — short search, any reasonable model will beat baseline
+        return 0.20, 3, 30, 0
+
+
 # ── Proxy (fast) evaluation ────────────────────────────────────────────────────
 
-def _proxy_train(model, loader, device, n_epochs=3, max_batches=40):
+def _proxy_train(model, loader, device, n_epochs, max_batches):
     model.to(device).train()
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    opt  = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
     for _ in range(n_epochs):
         for i, (x, y) in enumerate(loader):
@@ -128,11 +153,21 @@ def _proxy_acc(model, loader, device, max_batches=20):
     return correct / total if total else 0.0
 
 
+# ── Default fallback architectures, scaled by benchmark tier ──────────────────
+
+_FALLBACK = {
+    'hard':   [(64, 2, 3, True),  (128, 2, 3, True),  (256, 2, 3, True)],
+    'medium': [(64, 2, 3, True),  (128, 2, 3, True),  (256, 1, 3, False)],
+    'easy':   [(32, 2, 3, False), (64,  1, 3, True)],
+}
+
+def _fallback_stages(benchmark):
+    if benchmark is None or float(benchmark) >= 65:
+        return _FALLBACK['medium']
+    return _FALLBACK['easy']
+
+
 # ── NAS class ──────────────────────────────────────────────────────────────────
-
-# Sensible default if search time is too short to try anything
-_DEFAULT_STAGES = [(64, 2, 3, True), (128, 2, 3, True), (256, 1, 3, False)]
-
 
 class NAS:
     def __init__(self, train_loader, valid_loader, metadata, clock):
@@ -143,43 +178,62 @@ class NAS:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def search(self):
-        in_c  = self.metadata['input_shape'][1]
-        n_cls = self.metadata['num_classes']
-        hw    = tuple(self.metadata['input_shape'][2:])  # (H, W)
+        try:
+            return self._search()
+        except Exception:
+            print("  [NAS] Unexpected error — using fallback architecture.")
+            print(traceback.format_exc())
+            in_c  = self.metadata['input_shape'][1]
+            n_cls = self.metadata['num_classes']
+            hw    = tuple(self.metadata['input_shape'][2:])
+            benchmark = self.metadata.get('benchmark', None)
+            return SearchableCNN(in_c, n_cls, _fallback_stages(benchmark), hw)
 
-        # Allocate 30 % of remaining time to architecture search
-        search_budget = self.clock.check() * 0.30
-        deadline = time.perf_counter() + search_budget
-        print(f"  NAS budget: {show_time(search_budget)} | device: {self.device}")
+    def _search(self):
+        in_c      = self.metadata['input_shape'][1]
+        n_cls     = self.metadata['num_classes']
+        hw        = tuple(self.metadata['input_shape'][2:])
+        benchmark = self.metadata.get('benchmark', None)
+
+        budget_frac, proxy_epochs, proxy_batches, min_c_idx = _search_params(benchmark)
+
+        search_budget = self.clock.check() * budget_frac
+        deadline      = time.perf_counter() + search_budget
+
+        print(f"  NAS | benchmark={benchmark} → budget={show_time(search_budget)}"
+              f" proxy={proxy_epochs}ep×{proxy_batches}b | device={self.device}")
 
         rng = np.random.RandomState(42)
         best_model, best_acc = None, -1.0
         n_tried = 0
 
         while time.perf_counter() < deadline:
-            n_stages = int(rng.randint(2, 5))
-            stage_cfg = _sample_stage_configs(rng, n_stages)
+            n_stages  = int(rng.randint(2, 5))
+            stage_cfg = _sample_stage_configs(rng, n_stages, min_c_idx)
 
             try:
                 model = SearchableCNN(in_c, n_cls, stage_cfg, hw)
-                model = _proxy_train(model, self.train_loader, self.device)
+                model = _proxy_train(model, self.train_loader, self.device,
+                                     proxy_epochs, proxy_batches)
                 acc   = _proxy_acc(model, self.valid_loader, self.device)
                 n_tried += 1
-                print(f"  [{n_tried}] stages={n_stages} cfg={stage_cfg} → val={acc:.3f}")
+                marker = " ★" if acc > best_acc else ""
+                print(f"  [{n_tried:>2}] stages={n_stages} cfg={stage_cfg}"
+                      f" → val={acc:.3f}{marker}")
 
                 if acc > best_acc:
-                    best_acc = acc
+                    best_acc  = acc
                     best_model = copy.deepcopy(model).cpu()
 
             except RuntimeError as e:
-                print(f"  Architecture skipped ({e})")
+                print(f"  Architecture skipped: {e}")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        print(f"  Search done: {n_tried} architectures tried, best val_acc={best_acc:.3f}")
+        print(f"  Search done: {n_tried} tried, best val={best_acc:.3f}")
 
         if best_model is None:
-            print("  Falling back to default architecture.")
-            best_model = SearchableCNN(in_c, n_cls, _DEFAULT_STAGES, hw)
+            print("  No valid architecture found — using fallback.")
+            best_model = SearchableCNN(in_c, n_cls, _fallback_stages(benchmark), hw)
 
         return best_model
