@@ -1,6 +1,7 @@
 import copy
 import time
 import traceback
+import logging
 
 import numpy as np
 import torch
@@ -8,8 +9,11 @@ import torch.nn as nn
 
 from helpers import show_time
 
+logger = logging.getLogger(__name__)
 
-# ── Building blocks ────────────────────────────────────────────────────────────
+# ── Legacy fallback model (SearchableCNN) ─────────────────────────────────────
+# Kept intact so that if the new search space fails for any reason,
+# we still produce a working model.
 
 class ConvBnAct(nn.Module):
     def __init__(self, in_c, out_c, kernel=3, stride=1):
@@ -43,13 +47,9 @@ class ResBlock(nn.Module):
 
 
 class SearchableCNN(nn.Module):
-    """Configurable CNN built from a list of stage configs."""
+    """Configurable CNN built from a list of stage configs (legacy fallback)."""
 
     def __init__(self, in_channels, num_classes, stage_configs, input_hw):
-        """
-        stage_configs: list of (out_channels, num_blocks, kernel_size, use_residual)
-        input_hw: (H, W) — controls how many safe downsampling steps exist
-        """
         super().__init__()
         h = min(input_hw)
         max_pool_steps = 0
@@ -70,90 +70,13 @@ class SearchableCNN(nn.Module):
         self.features = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.drop = nn.Dropout(0.3)
-        self.fc = nn.Linear(c, num_classes)
+        self.fc   = nn.Linear(c, num_classes)
 
     def forward(self, x):
         x = self.features(x)
         x = self.pool(x).flatten(1)
         return self.fc(self.drop(x))
 
-
-# ── Search space ───────────────────────────────────────────────────────────────
-
-_CHANNELS = [32, 64, 128, 256]
-_KERNELS  = [3, 5]
-_BLOCKS   = [1, 2, 3]
-
-
-def _sample_stage_configs(rng, n_stages, min_c_idx=0):
-    """Sample a random stage config list. min_c_idx forces larger starting channels."""
-    configs = []
-    c_idx = min_c_idx
-    for _ in range(n_stages):
-        c_idx = int(rng.randint(c_idx, min(c_idx + 2, len(_CHANNELS) - 1) + 1))
-        configs.append((
-            _CHANNELS[c_idx],
-            int(rng.choice(_BLOCKS)),
-            int(rng.choice(_KERNELS)),
-            bool(rng.randint(0, 2)),
-        ))
-    return configs
-
-
-# ── Benchmark-aware search calibration ────────────────────────────────────────
-
-def _search_params(benchmark):
-    """
-    Return (budget_frac, proxy_epochs, proxy_batches, min_c_idx) tuned to benchmark.
-
-    Scoring formula: adj = (acc% - benchmark%) * 10/(100 - benchmark%)
-    High-benchmark datasets yield more points per % gain → invest more effort.
-    Low-benchmark datasets are easy to beat → a quick search suffices.
-    """
-    if benchmark is None:
-        return 0.30, 3, 40, 0
-    b = float(benchmark)
-    if b >= 85:
-        # Hard to beat but each % is worth a lot — maximise search depth
-        return 0.35, 5, 50, 1   # start channels at 64+
-    elif b >= 65:
-        return 0.30, 3, 40, 0
-    else:
-        # Easy win — short search, any reasonable model will beat baseline
-        return 0.20, 3, 30, 0
-
-
-# ── Proxy (fast) evaluation ────────────────────────────────────────────────────
-
-def _proxy_train(model, loader, device, n_epochs, max_batches):
-    model.to(device).train()
-    opt  = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    crit = nn.CrossEntropyLoss()
-    for _ in range(n_epochs):
-        for i, (x, y) in enumerate(loader):
-            if i >= max_batches:
-                break
-            x, y = x.to(device), y.to(device)
-            opt.zero_grad()
-            crit(model(x), y).backward()
-            opt.step()
-    return model
-
-
-def _proxy_acc(model, loader, device, max_batches=20):
-    model.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for i, (x, y) in enumerate(loader):
-            if i >= max_batches:
-                break
-            pred = model(x.to(device)).argmax(1).cpu()
-            correct += (pred == y).sum().item()
-            total   += y.size(0)
-    return correct / total if total else 0.0
-
-
-# ── Default fallback architectures, scaled by benchmark tier ──────────────────
 
 _FALLBACK = {
     'hard':   [(64, 2, 3, True),  (128, 2, 3, True),  (256, 2, 3, True)],
@@ -167,7 +90,33 @@ def _fallback_stages(benchmark):
     return _FALLBACK['easy']
 
 
-# ── NAS class ──────────────────────────────────────────────────────────────────
+# ── Search helpers ────────────────────────────────────────────────────────────
+
+def _search_params(benchmark):
+    """Budget fractions: (search_frac, n_population, n_rounds, tournament_k)."""
+    if benchmark is None:
+        return 0.30, 30, 100, 7
+    b = float(benchmark)
+    if b >= 85:
+        return 0.35, 40, 150, 10
+    elif b >= 65:
+        return 0.30, 30, 100, 7
+    else:
+        return 0.20, 20, 60, 5
+
+
+def _get_proxy_batch(train_loader, device, batch_size=16):
+    """Grab a single small batch for zero-cost proxy evaluation."""
+    try:
+        x, _ = next(iter(train_loader))
+        if x.size(0) > batch_size:
+            x = x[:batch_size]
+        return x.to(device)
+    except Exception:
+        return None
+
+
+# ── NAS class ─────────────────────────────────────────────────────────────────
 
 class NAS:
     def __init__(self, train_loader, valid_loader, metadata, clock):
@@ -183,25 +132,114 @@ class NAS:
         except Exception:
             print("  [NAS] Unexpected error — using fallback architecture.")
             print(traceback.format_exc())
-            in_c  = self.metadata['input_shape'][1]
-            n_cls = self.metadata['num_classes']
-            hw    = tuple(self.metadata['input_shape'][2:])
+            in_c      = self.metadata['input_shape'][1]
+            n_cls     = self.metadata['num_classes']
+            hw        = tuple(self.metadata['input_shape'][2:])
             benchmark = self.metadata.get('benchmark', None)
             return SearchableCNN(in_c, n_cls, _fallback_stages(benchmark), hw)
 
     def _search(self):
-        in_c      = self.metadata['input_shape'][1]
+        shape     = self.metadata['input_shape']
+        in_c      = shape[1]
+        H, W      = shape[2], shape[3]
         n_cls     = self.metadata['num_classes']
-        hw        = tuple(self.metadata['input_shape'][2:])
         benchmark = self.metadata.get('benchmark', None)
 
-        budget_frac, proxy_epochs, proxy_batches, min_c_idx = _search_params(benchmark)
-
-        search_budget = self.clock.check() * budget_frac
-        deadline      = time.perf_counter() + search_budget
-
+        search_frac, n_pop, n_rounds, tourney_k = _search_params(benchmark)
+        search_budget = self.clock.check() * search_frac
         print(f"  NAS | benchmark={benchmark} → budget={show_time(search_budget)}"
-              f" proxy={proxy_epochs}ep×{proxy_batches}b | device={self.device}")
+              f"  pop={n_pop} rounds={n_rounds} | device={self.device}")
+
+        # ── Import search space ───────────────────────────────────────────────
+        try:
+            from search_space import (
+                infer_family, sample_random_genotype, repair,
+                build_model, az_nas_score, aging_evolution, best_individual,
+            )
+        except ImportError as e:
+            print(f"  [NAS] search_space import failed ({e}), using legacy fallback.")
+            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+
+        # ── Proxy batch ───────────────────────────────────────────────────────
+        proxy_batch = _get_proxy_batch(self.train_loader, self.device)
+        if proxy_batch is None:
+            print("  [NAS] Could not get proxy batch — using legacy fallback.")
+            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+
+        family = infer_family(in_c, H, W, n_cls)
+        print(f"  NAS | family={family.name}  aniso={family.is_anisotropic}"
+              f"  max_pools={family.max_pool_steps}  groupnorm={family.force_groupnorm}")
+
+        def proxy_fn(model, batch_x, device):
+            return az_nas_score(model, batch_x, device, reinit=True)
+
+        # ── Aging evolution ───────────────────────────────────────────────────
+        try:
+            population = aging_evolution(
+                family          = family,
+                C               = in_c,
+                H               = H,
+                W               = W,
+                num_classes     = n_cls,
+                proxy_fn        = proxy_fn,
+                batch_x         = proxy_batch,
+                device          = self.device,
+                n_population    = n_pop,
+                n_rounds        = n_rounds,
+                tournament_size = tourney_k,
+                time_budget_s   = search_budget,
+                verbose         = True,
+            )
+        except Exception as e:
+            print(f"  [NAS] Evolution failed ({e}) — using legacy fallback.")
+            traceback.print_exc()
+            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+
+        best = best_individual(population)
+        if best is None:
+            print("  [NAS] Empty population — using legacy fallback.")
+            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+
+        print(f"  Search done: best AZ-NAS score={best.fitness:.4f}")
+
+        try:
+            model = build_model(
+                best.genotype, in_c, H, W, n_cls,
+                aniso_axis=family.aniso_axis,
+            )
+            # quick sanity check
+            with torch.no_grad():
+                dummy = torch.randn(2, in_c, H, W).to(self.device)
+                model.to(self.device)(dummy)
+            return model.cpu()
+        except Exception as e:
+            print(f"  [NAS] Model build failed ({e}) — using legacy fallback.")
+            traceback.print_exc()
+            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+
+    # ── Legacy search (random + proxy train) ─────────────────────────────────
+
+    _CHANNELS_L = [32, 64, 128, 256]
+    _KERNELS_L  = [3, 5]
+    _BLOCKS_L   = [1, 2, 3]
+
+    def _sample_stage_configs_legacy(self, rng, n_stages, min_c_idx=0):
+        configs = []
+        c_idx = min_c_idx
+        for _ in range(n_stages):
+            c_idx = int(rng.randint(c_idx, min(c_idx + 2, len(self._CHANNELS_L) - 1) + 1))
+            configs.append((
+                self._CHANNELS_L[c_idx],
+                int(rng.choice(self._BLOCKS_L)),
+                int(rng.choice(self._KERNELS_L)),
+                bool(rng.randint(0, 2)),
+            ))
+        return configs
+
+    def _legacy_search(self, in_c, n_cls, hw, benchmark):
+        budget_frac, proxy_epochs, proxy_batches = 0.25, 3, 40
+        search_budget = self.clock.check() * budget_frac
+        deadline = time.perf_counter() + search_budget
 
         rng = np.random.RandomState(42)
         best_model, best_acc = None, -1.0
@@ -209,31 +247,48 @@ class NAS:
 
         while time.perf_counter() < deadline:
             n_stages  = int(rng.randint(2, 5))
-            stage_cfg = _sample_stage_configs(rng, n_stages, min_c_idx)
-
+            stage_cfg = self._sample_stage_configs_legacy(rng, n_stages)
             try:
                 model = SearchableCNN(in_c, n_cls, stage_cfg, hw)
-                model = _proxy_train(model, self.train_loader, self.device,
-                                     proxy_epochs, proxy_batches)
-                acc   = _proxy_acc(model, self.valid_loader, self.device)
+                model = self._proxy_train(model, proxy_epochs, proxy_batches)
+                acc   = self._proxy_acc(model)
                 n_tried += 1
                 marker = " ★" if acc > best_acc else ""
-                print(f"  [{n_tried:>2}] stages={n_stages} cfg={stage_cfg}"
-                      f" → val={acc:.3f}{marker}")
-
+                print(f"  [legacy {n_tried:>2}] → val={acc:.3f}{marker}")
                 if acc > best_acc:
-                    best_acc  = acc
+                    best_acc   = acc
                     best_model = copy.deepcopy(model).cpu()
-
             except RuntimeError as e:
                 print(f"  Architecture skipped: {e}")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        print(f"  Search done: {n_tried} tried, best val={best_acc:.3f}")
-
         if best_model is None:
-            print("  No valid architecture found — using fallback.")
             best_model = SearchableCNN(in_c, n_cls, _fallback_stages(benchmark), hw)
-
         return best_model
+
+    def _proxy_train(self, model, n_epochs, max_batches):
+        model.to(self.device).train()
+        opt  = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        crit = nn.CrossEntropyLoss()
+        for _ in range(n_epochs):
+            for i, (x, y) in enumerate(self.train_loader):
+                if i >= max_batches:
+                    break
+                x, y = x.to(self.device), y.to(self.device)
+                opt.zero_grad()
+                crit(model(x), y).backward()
+                opt.step()
+        return model
+
+    def _proxy_acc(self, model, max_batches=20):
+        model.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for i, (x, y) in enumerate(self.valid_loader):
+                if i >= max_batches:
+                    break
+                pred = model(x.to(self.device)).argmax(1).cpu()
+                correct += (pred == y).sum().item()
+                total   += y.size(0)
+        return correct / total if total else 0.0
