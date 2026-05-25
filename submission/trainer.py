@@ -39,6 +39,14 @@ class Trainer:
         self.valid_dl = valid_dataloader
         self.metadata = metadata
         self.clock    = clock
+        # XLA (TPU) support: import mark_step if device is xla
+        self._xm = None
+        if str(device).startswith('xla'):
+            try:
+                import torch_xla.core.xla_model as xm
+                self._xm = xm
+            except ImportError:
+                pass
 
     # ------------------------------------------------------------------
     def train(self):
@@ -105,6 +113,8 @@ class Trainer:
                 nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                if self._xm is not None:
+                    self._xm.mark_step()
 
                 labels += y.cpu().tolist()
                 preds  += out.detach().argmax(1).cpu().tolist()
