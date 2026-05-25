@@ -207,15 +207,62 @@ class NAS:
                 best.genotype, in_c, H, W, n_cls,
                 aniso_axis=family.aniso_axis,
             )
-            # quick sanity check
-            with torch.no_grad():
-                dummy = torch.randn(2, in_c, H, W).to(self.device)
-                model.to(self.device)(dummy)
+            model.to(self.device)
+
+            # ── Speed check: ensure the model can fit ≥ MIN_EPOCHS in budget ──
+            model = self._speed_guard(model, in_c, H, W, n_cls, benchmark)
             return model.cpu()
         except Exception as e:
             print(f"  [NAS] Model build failed ({e}) — using legacy fallback.")
             traceback.print_exc()
             return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+
+    # ── Speed guard ───────────────────────────────────────────────────────────
+
+    def _speed_guard(self, model, in_c, H, W, n_cls, benchmark, min_epochs=5):
+        """
+        Estimate one training epoch's wall-clock cost.  If the model is too slow
+        to complete min_epochs within the remaining training budget, replace it
+        with a lightweight fallback so at least a few epochs can run.
+        """
+        try:
+            n_train  = sum(1 for _ in self.train_loader)   # number of batches
+            t_budget = self.clock.check()                   # seconds left total
+            # training gets budget_frac of whatever remains after search
+            from trainer import _train_params
+            budget_frac, _ = _train_params(benchmark)
+            train_budget_s  = t_budget * budget_frac
+
+            # Time forward+backward over a few real batches
+            model.train()
+            opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+            crit = torch.nn.CrossEntropyLoss()
+            probe_batches = min(5, n_train)
+            t0 = time.perf_counter()
+            for i, (x, y) in enumerate(self.train_loader):
+                if i >= probe_batches:
+                    break
+                x, y = x.to(self.device), y.to(self.device)
+                opt.zero_grad()
+                crit(model(x), y).backward()
+                opt.step()
+            probe_s = time.perf_counter() - t0
+
+            # Extrapolate to a full epoch
+            epoch_s = probe_s / probe_batches * n_train
+            feasible_epochs = train_budget_s / epoch_s if epoch_s > 0 else 999
+            print(f"  Speed check: ~{epoch_s:.0f}s/epoch, "
+                  f"budget={train_budget_s:.0f}s → ~{feasible_epochs:.1f} epochs")
+
+            if feasible_epochs < min_epochs:
+                print(f"  Model too slow for {min_epochs} epochs — falling back to lightweight arch.")
+                light = SearchableCNN(in_c, n_cls, _fallback_stages(benchmark), (H, W))
+                return light.to(self.device)
+
+        except Exception as e:
+            print(f"  [NAS] Speed check failed ({e}) — keeping NAS model.")
+
+        return model
 
     # ── Legacy search (random + proxy train) ─────────────────────────────────
 
