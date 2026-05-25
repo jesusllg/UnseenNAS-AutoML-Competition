@@ -101,6 +101,9 @@ def main():
     print("="*13 + "    Your NAS Unseen-Data 2026 Submission is running     " + "="*13)
     print("="*78)
 
+    # Ensure predictions output directory exists before any dataset runs
+    os.makedirs("predictions", exist_ok=True)
+
     # iterate over datasets in the datasets directory
     for dataset in os.listdir("datasets"):
         metadata = load_dataset_metadata(f'datasets/{dataset}')

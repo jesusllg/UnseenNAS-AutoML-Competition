@@ -143,24 +143,66 @@ def _download_ncl(name, info, dest_dir, session):
     print(f"  URL: {url}")
     raw = _download_bytes(url, session, label=name)
 
-    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        members = zf.namelist()
-        for member in members:
-            fname = Path(member).name
-            if fname in REQUIRED_FILES or fname.endswith(".npy"):
-                zf.extract(member, dest_dir)
-                extracted = dest_dir / member
-                final = dest_dir / fname
-                if extracted != final:
-                    final.parent.mkdir(parents=True, exist_ok=True)
-                    extracted.rename(final)
+    # Try as ZIP first; some NCL articles serve individual files instead
+    if zipfile.is_zipfile(io.BytesIO(raw)):
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            members = zf.namelist()
+            for member in members:
+                fname = Path(member).name
+                if fname in REQUIRED_FILES or fname.endswith(".npy"):
+                    zf.extract(member, dest_dir)
+                    extracted = dest_dir / member
+                    final = dest_dir / fname
+                    if extracted != final:
+                        final.parent.mkdir(parents=True, exist_ok=True)
+                        extracted.rename(final)
 
-    # Clean up any subdirectories left behind by the ZIP
-    for item in dest_dir.iterdir():
-        if item.is_dir():
-            for sub in item.iterdir():
-                sub.rename(dest_dir / sub.name)
-            item.rmdir()
+        # Clean up any subdirectories left behind by the ZIP
+        for item in dest_dir.iterdir():
+            if item.is_dir():
+                for sub in item.iterdir():
+                    sub.rename(dest_dir / sub.name)
+                try:
+                    item.rmdir()
+                except OSError:
+                    pass
+    else:
+        # Not a zip — fall back to figshare v2 API to fetch individual files
+        print(f"  Not a zip — trying figshare v2 API for individual files…")
+        _download_ncl_via_api(name, info, dest_dir, session)
+
+
+def _download_ncl_via_api(name, info, dest_dir, session):
+    """Download individual dataset files using the figshare v2 REST API."""
+    api_url = f"https://api.figshare.com/v2/articles/{info['ncl_id']}/files"
+    print(f"  API: {api_url}")
+
+    try:
+        raw_meta = _download_bytes(api_url, session, label=f"{name}-api")
+        files_meta = json.loads(raw_meta)
+    except Exception as e:
+        raise RuntimeError(f"figshare API call failed: {e}")
+
+    if not isinstance(files_meta, list) or len(files_meta) == 0:
+        raise RuntimeError("figshare API returned no files")
+
+    downloaded = 0
+    for file_info in files_meta:
+        fname = file_info.get("name", "")
+        dl_url = file_info.get("download_url", "")
+        if not dl_url:
+            dl_url = file_info.get("downloadUrl", "")
+        if fname in REQUIRED_FILES or fname.endswith(".npy"):
+            print(f"  Downloading file: {fname}")
+            data = _download_bytes(dl_url, session, label=fname)
+            (dest_dir / fname).write_bytes(data)
+            downloaded += 1
+
+    if downloaded == 0:
+        raise RuntimeError(
+            f"figshare API listed {len(files_meta)} files but none matched required names: "
+            f"{[f.get('name') for f in files_meta]}"
+        )
 
 
 def _download_edinburgh(name, info, dest_dir, session):
