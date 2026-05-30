@@ -143,6 +143,7 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
     meta['es_delta_start']      = args.es_delta_start
     meta['es_delta_min']        = args.es_delta_min
     meta['es_delta_decay']      = args.es_delta_decay
+    meta['es_plateau_patience'] = args.es_plateau_patience
     meta['es_regression_delta'] = args.es_regression_delta
 
     es_str = (f"↑δ{args.es_delta_start:.4f}↘{args.es_delta_min:.4f} "
@@ -154,7 +155,7 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
           f" | ES={es_str}")
     _injected = {'seed','search_frac','n_population','n_rounds','tournament_size',
                  'proxy_epochs','proxy_batches','train_frac','weight_decay',
-                 'es_enabled','es_patience','es_min_epochs',
+                 'es_enabled','es_patience','es_plateau_patience','es_min_epochs',
                  'es_delta_start','es_delta_min','es_delta_decay','es_regression_delta'}
     [print(f"  {k}: {v}") for k, v in meta.items() if k not in _injected]
 
@@ -265,6 +266,8 @@ def main():
                     help="Floor for delta after decay. (default: 0.001 = 0.1pp)")
     ap.add_argument("--es-delta-decay",       type=int,   default=5,
                     help="Improvements before halving delta. (default: 5)")
+    ap.add_argument("--es-plateau-patience", type=int,   default=15,
+                    help="Consecutive plateau epochs before stopping. (default: 15)")
     ap.add_argument("--es-regression-delta", type=float, default=0.005,
                     help="Fall >X below best to count as bad epoch. (default: 0.010 = 1pp)")
     args = ap.parse_args()

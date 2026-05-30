@@ -22,6 +22,7 @@ _WEIGHT_DECAY = 1e-4
 # Early stopping defaults
 _ES_ENABLED          = True
 _ES_PATIENCE         = 20     # consecutive regression epochs before stopping
+_ES_PLATEAU_PATIENCE = 15     # consecutive plateau epochs before stopping
 _ES_MIN_EPOCHS       = 10     # warmup: ES cannot trigger before this epoch
 _ES_DELTA_START      = 0.005  # initial improvement threshold (0.5 pp)
 _ES_DELTA_MIN        = 0.001  # floor for improvement delta (0.1 pp)
@@ -34,18 +35,18 @@ class _EarlyStopper:
     Regression-based early stopping with dynamic improvement delta.
 
     Three zones per epoch (after min_epochs warmup):
-      ★ Improvement : val > best + delta        → reset wait, update best, decay delta
-      ↓ Regression  : val < best - reg_delta    → wait += 1
-      ~ Plateau     : in between                → wait unchanged
+      ★ Improvement : val > best + delta        → reset both counters, update best
+      ↓ Regression  : val < best - reg_delta    → regression_wait += 1
+      ~ Plateau     : in between                → plateau_wait += 1
 
-    Near-perfect models (99%+) naturally live in the plateau zone since
-    normal oscillations (0.1–0.2 pp) stay within reg_delta (1 pp).
-    Only a genuine collapse triggers wait accumulation.
+    Stops when regression_wait >= patience  OR  plateau_wait >= plateau_patience.
+    Plateau patience catches models stuck at theoretical maximum (e.g. 100%).
     """
 
-    def __init__(self, patience, min_epochs, delta_start, delta_min,
-                 delta_decay, regression_delta, enabled):
+    def __init__(self, patience, plateau_patience, min_epochs, delta_start,
+                 delta_min, delta_decay, regression_delta, enabled):
         self.patience         = patience
+        self.plateau_patience = plateau_patience
         self.min_epochs       = min_epochs
         self.delta            = delta_start
         self.delta_min        = delta_min
@@ -53,17 +54,19 @@ class _EarlyStopper:
         self.regression_delta = regression_delta
         self.enabled          = enabled
         self.best             = -float('inf')
-        self.wait             = 0
+        self.wait             = 0   # regression counter
+        self.plateau_wait     = 0   # plateau counter
         self.improve_count    = 0
 
     def step(self, val_acc, epoch):
-        """Return True if training should stop. Returns zone char for logging."""
+        """Return (stop, zone_char) for logging."""
         if not self.enabled or epoch < self.min_epochs:
             return False, '~'
 
         if val_acc > self.best + self.delta:
             self.best = val_acc
             self.wait = 0
+            self.plateau_wait = 0
             self.improve_count += 1
             if self.improve_count % self.delta_decay == 0:
                 old = self.delta
@@ -74,9 +77,11 @@ class _EarlyStopper:
             return False, '★'
         elif val_acc < self.best - self.regression_delta:
             self.wait += 1
+            self.plateau_wait = 0
             return self.wait >= self.patience, '↓'
         else:
-            return False, '~'
+            self.plateau_wait += 1
+            return self.plateau_wait >= self.plateau_patience, '~'
 
 
 class Trainer:
@@ -123,14 +128,15 @@ class Trainer:
         t_train_start  = time.perf_counter()
 
         # Early stopping (regression-based with dynamic improvement delta)
-        es_enabled        = self.metadata.get('es_enabled',          _ES_ENABLED)
-        es_patience       = self.metadata.get('es_patience',         _ES_PATIENCE)
-        es_min_epochs     = self.metadata.get('es_min_epochs',       _ES_MIN_EPOCHS)
-        es_delta_start    = self.metadata.get('es_delta_start',      _ES_DELTA_START)
-        es_delta_min      = self.metadata.get('es_delta_min',        _ES_DELTA_MIN)
-        es_delta_decay    = self.metadata.get('es_delta_decay',      _ES_DELTA_DECAY)
-        es_regression_delta = self.metadata.get('es_regression_delta', _ES_REGRESSION_DELTA)
-        stopper = _EarlyStopper(es_patience, es_min_epochs,
+        es_enabled          = self.metadata.get('es_enabled',           _ES_ENABLED)
+        es_patience         = self.metadata.get('es_patience',          _ES_PATIENCE)
+        es_plateau_patience = self.metadata.get('es_plateau_patience',  _ES_PLATEAU_PATIENCE)
+        es_min_epochs       = self.metadata.get('es_min_epochs',        _ES_MIN_EPOCHS)
+        es_delta_start      = self.metadata.get('es_delta_start',       _ES_DELTA_START)
+        es_delta_min        = self.metadata.get('es_delta_min',         _ES_DELTA_MIN)
+        es_delta_decay      = self.metadata.get('es_delta_decay',       _ES_DELTA_DECAY)
+        es_regression_delta = self.metadata.get('es_regression_delta',  _ES_REGRESSION_DELTA)
+        stopper = _EarlyStopper(es_patience, es_plateau_patience, es_min_epochs,
                                 es_delta_start, es_delta_min,
                                 es_delta_decay, es_regression_delta, es_enabled)
 
@@ -138,7 +144,7 @@ class Trainer:
         label_smoothing = 0.1 if n_cls >= 10 else 0.0
 
         es_desc = (f"δ↑{es_delta_start:.4f}↘{es_delta_min:.4f}/{es_delta_decay} "
-                   f"↓{es_regression_delta:.4f} p={es_patience}") if es_enabled else "off"
+                   f"↓{es_regression_delta:.4f} p={es_patience}/~{es_plateau_patience}") if es_enabled else "off"
         print(f"  Trainer | budget={show_time(train_budget)} wd={weight_decay:.0e}"
               f" | ES={es_desc} | device={self.device}")
 
@@ -210,9 +216,9 @@ class Trainer:
 
             if stop:
                 saved = show_time(max(0.0, deadline - time.perf_counter()))
-                print(f"  Early stop at epoch {epoch} "
-                      f"(regression ↓>{es_regression_delta*100:.1f}pp × {es_patience} ep)."
-                      f" ~{saved} returned to pool.")
+                reason = (f"plateau ~×{es_plateau_patience}" if zone == '~'
+                          else f"regression ↓>{es_regression_delta*100:.1f}pp ×{es_patience}")
+                print(f"  Early stop at epoch {epoch} ({reason}). ~{saved} returned to pool.")
                 break
 
         if best_state is not None:
