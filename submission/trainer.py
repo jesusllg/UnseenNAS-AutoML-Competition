@@ -21,24 +21,25 @@ _WEIGHT_DECAY = 1e-4
 
 # Early stopping defaults
 _ES_ENABLED      = True
-_ES_PATIENCE     = 15     # non-improvement epochs before stopping
+_ES_PATIENCE     = 40     # consecutive non-improving epochs before stopping
 _ES_MIN_EPOCHS   = 10     # warmup: ES cannot trigger before this epoch
 _ES_DELTA_START  = 0.005  # initial min-improvement threshold (0.5 pp)
-_ES_DELTA_MIN    = 5e-5   # floor for delta after decay (~0.005 pp)
-_ES_DELTA_DECAY  = 5      # consecutive improvements before halving delta
+_ES_DELTA_MIN    = 0.001  # floor for delta (0.1 pp) — keeps threshold achievable
+_ES_DELTA_DECAY  = 5      # improvements before halving delta
 
 
 class _EarlyStopper:
     """
-    Cumulative early stopping with dynamic delta.
+    Consecutive early stopping with dynamic delta.
 
-    `wait` counts total epochs where val_acc <= best + delta (not consecutive).
-    On a good epoch (val > best + delta), best is updated but wait stays.
+    `wait` counts consecutive epochs where val_acc <= best + delta.
+    On a good epoch (val > best + delta), best is updated and wait resets to 0.
     On a bad epoch, wait increments by 1.
-    Stops when total bad epochs reach `patience`.
+    Stops when consecutive bad epochs reach `patience`.
 
     Delta decays every `delta_decay` total improvements, making the bar
-    progressively stricter over time (finer-grained progress detection).
+    progressively stricter. Floor at delta_min keeps the threshold achievable
+    (avoids impossible targets like >100% accuracy).
     Disabled entirely when enabled=False.
     """
 
@@ -51,7 +52,7 @@ class _EarlyStopper:
         self.delta_decay   = delta_decay
         self.enabled       = enabled
         self.best          = -float('inf')
-        self.wait          = 0   # cumulative bad epochs
+        self.wait          = 0   # consecutive bad epochs
         self.improve_count = 0   # total improvements (for delta decay)
 
     def step(self, val_acc, epoch):
@@ -61,6 +62,7 @@ class _EarlyStopper:
 
         if val_acc > self.best + self.delta:
             self.best = val_acc
+            self.wait = 0
             self.improve_count += 1
             # Tighten the bar every delta_decay total improvements
             if self.improve_count % self.delta_decay == 0:

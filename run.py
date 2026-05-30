@@ -242,16 +242,16 @@ def main():
     # ── Early stopping (dynamic delta) ───────────────────────────────────────
     ap.add_argument("--no-es", dest="es_enabled", action="store_false", default=True,
                     help="Disable early stopping entirely.")
-    ap.add_argument("--es-patience",     type=int,   default=15,
-                    help="Epochs without improvement before stopping. (default: 15)")
+    ap.add_argument("--es-patience",     type=int,   default=40,
+                    help="Consecutive non-improving epochs before stopping. (default: 40)")
     ap.add_argument("--es-min-epochs",   type=int,   default=10,
                     help="Minimum epochs before ES can trigger. (default: 10)")
     ap.add_argument("--es-delta-start",  type=float, default=0.005,
                     help="Initial min-improvement threshold. (default: 0.005 = 0.5pp)")
-    ap.add_argument("--es-delta-min",    type=float, default=5e-5,
-                    help="Floor for delta after decay. (default: 5e-5 ≈ 0.005pp)")
+    ap.add_argument("--es-delta-min",    type=float, default=0.001,
+                    help="Floor for delta after decay. (default: 0.001 = 0.1pp)")
     ap.add_argument("--es-delta-decay",  type=int,   default=5,
-                    help="Consecutive improvements before halving delta. (default: 5)")
+                    help="Improvements before halving delta. (default: 5)")
     args = ap.parse_args()
 
     # Validate fractions
