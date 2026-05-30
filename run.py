@@ -133,18 +133,23 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
     meta['proxy_batches'] = args.proxy_batches
     meta['train_frac']    = args.train_frac
     meta['weight_decay']  = args.weight_decay
-    meta['es_patience']   = args.es_patience
-    meta['es_min_delta']  = args.es_min_delta
-    meta['es_min_epochs'] = args.es_min_epochs
+    meta['es_enabled']     = args.es_enabled
+    meta['es_patience']    = args.es_patience
+    meta['es_min_epochs']  = args.es_min_epochs
+    meta['es_delta_start'] = args.es_delta_start
+    meta['es_delta_min']   = args.es_delta_min
+    meta['es_delta_decay'] = args.es_delta_decay
 
+    es_str = (f"δ {args.es_delta_start:.5f}↘{args.es_delta_min:.5f}"
+              f"/{args.es_delta_decay}↑ p={args.es_patience}") if args.es_enabled else "off"
     print(f"\n{'='*10} {codename:^20} {'='*10}")
     print(f"  time={hours}h | truncate={args.truncate}"
-          f" | search_frac={args.search_frac} proxy={args.proxy_epochs}ep×{args.proxy_batches}b"
-          f" | train_frac={args.train_frac} wd={args.weight_decay:.0e}"
-          f" | ES patience={args.es_patience}")
-    [print(f"  {k}: {v}") for k, v in meta.items()
-     if k not in ('search_frac','proxy_epochs','proxy_batches','train_frac',
-                  'weight_decay','es_patience','es_min_delta','es_min_epochs')]
+          f" | search={args.search_frac} train={args.train_frac} wd={args.weight_decay:.0e}"
+          f" | proxy {args.proxy_epochs}ep×{args.proxy_batches}b | ES={es_str}")
+    _injected = {'search_frac','proxy_epochs','proxy_batches','train_frac','weight_decay',
+                 'es_enabled','es_patience','es_min_epochs',
+                 'es_delta_start','es_delta_min','es_delta_decay'}
+    [print(f"  {k}: {v}") for k, v in meta.items() if k not in _injected]
 
     t0 = time.perf_counter()
     try:
@@ -220,13 +225,19 @@ def main():
                     help="Max batches per epoch during proxy eval. (default: 40)")
     ap.add_argument("--weight-decay",  type=float, default=1e-4,
                     help="AdamW weight decay for final training. (default: 1e-4)")
-    # ── Early stopping ────────────────────────────────────────────────────────
-    ap.add_argument("--es-patience",   type=int,   default=15,
-                    help="Early stopping: epochs without improvement before stopping. (default: 15)")
-    ap.add_argument("--es-min-delta",  type=float, default=0.001,
-                    help="Early stopping: minimum improvement to reset patience. (default: 0.001)")
-    ap.add_argument("--es-min-epochs", type=int,   default=10,
-                    help="Early stopping: minimum epochs before stopping is allowed. (default: 10)")
+    # ── Early stopping (dynamic delta) ───────────────────────────────────────
+    ap.add_argument("--no-es", dest="es_enabled", action="store_false", default=True,
+                    help="Disable early stopping entirely.")
+    ap.add_argument("--es-patience",     type=int,   default=15,
+                    help="Epochs without improvement before stopping. (default: 15)")
+    ap.add_argument("--es-min-epochs",   type=int,   default=10,
+                    help="Minimum epochs before ES can trigger. (default: 10)")
+    ap.add_argument("--es-delta-start",  type=float, default=0.005,
+                    help="Initial min-improvement threshold. (default: 0.005 = 0.5pp)")
+    ap.add_argument("--es-delta-min",    type=float, default=5e-5,
+                    help="Floor for delta after decay. (default: 5e-5 ≈ 0.005pp)")
+    ap.add_argument("--es-delta-decay",  type=int,   default=5,
+                    help="Consecutive improvements before halving delta. (default: 5)")
     args = ap.parse_args()
 
     # Validate fractions
@@ -268,15 +279,21 @@ def main():
     else:
         targets = available
 
-    print(f"Running {len(targets)} dataset(s): {[p.name for p in targets]}")
+    n_ds = len(targets)
+    n_avail = len(available)
+    print(f"Detected {n_avail} dataset(s) in {datasets_dir}/")
+    if args.dataset:
+        print(f"Running {n_ds}/{n_avail} selected: {[p.name for p in targets]}")
+    else:
+        print(f"Running all {n_ds}: {[p.name for p in targets]}")
 
     # ── Time budget setup ─────────────────────────────────────────────────────
     budget = None
     if args.total_time is not None:
-        budget = GlobalTimeBudget(args.total_time, len(targets), args.min_time)
-        print(f"Global budget: {args.total_time}h total"
-              f" | min {args.min_time}h/dataset"
-              f" | ~{args.total_time/len(targets):.2f}h/dataset initially")
+        budget = GlobalTimeBudget(args.total_time, n_ds, args.min_time)
+        per = args.total_time / n_ds
+        print(f"Global budget: {args.total_time}h / {n_ds} datasets"
+              f" = ~{per:.2f}h each (floor {args.min_time}h)")
 
     results = {}
     for ds_path in targets:

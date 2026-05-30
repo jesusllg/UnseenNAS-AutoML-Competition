@@ -23,9 +23,12 @@ _SEARCH_FRAC  = 0.30   # kept here only as the default denominator reference
 _WEIGHT_DECAY = 1e-4
 
 # Early stopping defaults
-_ES_PATIENCE   = 15
-_ES_MIN_DELTA  = 0.001
-_ES_MIN_EPOCHS = 10
+_ES_ENABLED      = True
+_ES_PATIENCE     = 15     # non-improvement epochs before stopping
+_ES_MIN_EPOCHS   = 10     # warmup: ES cannot trigger before this epoch
+_ES_DELTA_START  = 0.005  # initial min-improvement threshold (0.5 pp)
+_ES_DELTA_MIN    = 5e-5   # floor for delta after decay (~0.005 pp)
+_ES_DELTA_DECAY  = 5      # consecutive improvements before halving delta
 
 
 def _set_seeds():
@@ -38,24 +41,48 @@ def _set_seeds():
 
 
 class _EarlyStopper:
-    """Prechelt-style patience-based early stopping on validation accuracy."""
+    """
+    Dynamic-delta early stopping.
 
-    def __init__(self, patience, min_delta, min_epochs):
-        self.patience   = patience
-        self.min_delta  = min_delta
-        self.min_epochs = min_epochs
-        self.best       = -float('inf')
-        self.wait       = 0
+    Delta starts at delta_start and halves every time we see delta_decay
+    consecutive improving epochs — making the bar progressively stricter.
+    If val_acc doesn't clear (best + delta) for `patience` epochs in a row,
+    training stops.  Disabled entirely when enabled=False.
+    """
+
+    def __init__(self, patience, min_epochs, delta_start, delta_min,
+                 delta_decay, enabled):
+        self.patience       = patience
+        self.min_epochs     = min_epochs
+        self.delta          = delta_start
+        self.delta_min      = delta_min
+        self.delta_decay    = delta_decay
+        self.enabled        = enabled
+        self.best           = -float('inf')
+        self.wait           = 0
+        self.improve_streak = 0
 
     def step(self, val_acc, epoch):
         """Return True if training should stop."""
-        if epoch < self.min_epochs:
+        if not self.enabled or epoch < self.min_epochs:
             return False
-        if val_acc > self.best + self.min_delta:
+
+        if val_acc > self.best + self.delta:
             self.best = val_acc
             self.wait = 0
+            self.improve_streak += 1
+            # Tighten the bar after a run of consecutive improvements
+            if self.improve_streak >= self.delta_decay:
+                old = self.delta
+                self.delta = max(self.delta * 0.5, self.delta_min)
+                self.improve_streak = 0
+                if self.delta < old:
+                    print(f"  [ES] Δ {old:.5f}→{self.delta:.5f} "
+                          f"(after {self.delta_decay} improvements)")
         else:
             self.wait += 1
+            self.improve_streak = 0
+
         return self.wait >= self.patience
 
 
@@ -102,17 +129,24 @@ class Trainer:
         deadline       = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 
-        # Early stopping
-        es_patience   = self.metadata.get('es_patience',   _ES_PATIENCE)
-        es_min_delta  = self.metadata.get('es_min_delta',  _ES_MIN_DELTA)
-        es_min_epochs = self.metadata.get('es_min_epochs', _ES_MIN_EPOCHS)
-        stopper = _EarlyStopper(es_patience, es_min_delta, es_min_epochs)
+        # Early stopping (dynamic delta)
+        es_enabled     = self.metadata.get('es_enabled',     _ES_ENABLED)
+        es_patience    = self.metadata.get('es_patience',    _ES_PATIENCE)
+        es_min_epochs  = self.metadata.get('es_min_epochs',  _ES_MIN_EPOCHS)
+        es_delta_start = self.metadata.get('es_delta_start', _ES_DELTA_START)
+        es_delta_min   = self.metadata.get('es_delta_min',   _ES_DELTA_MIN)
+        es_delta_decay = self.metadata.get('es_delta_decay', _ES_DELTA_DECAY)
+        stopper = _EarlyStopper(es_patience, es_min_epochs,
+                                es_delta_start, es_delta_min,
+                                es_delta_decay, es_enabled)
 
         n_cls = self.metadata['num_classes']
         label_smoothing = 0.1 if n_cls >= 10 else 0.0
 
+        es_desc = (f"δ {es_delta_start:.5f}↘{es_delta_min:.5f} every {es_delta_decay}↑"
+                   f" p={es_patience}") if es_enabled else "off"
         print(f"  Trainer | budget={show_time(train_budget)} wd={weight_decay:.0e}"
-              f" es={es_patience}p/{es_min_epochs}min | device={self.device}")
+              f" | ES={es_desc} | device={self.device}")
 
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         optimizer = optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=weight_decay)
@@ -177,8 +211,9 @@ class Trainer:
                 best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
 
             if stopper.step(val_acc, epoch):
-                saved = show_time(deadline - time.perf_counter())
-                print(f"  Early stop at epoch {epoch} (patience={es_patience})."
+                saved = show_time(max(0.0, deadline - time.perf_counter()))
+                print(f"  Early stop at epoch {epoch} "
+                      f"(plateau {es_patience} ep, Δ={stopper.delta:.5f})."
                       f" ~{saved} returned to pool.")
                 break
 
