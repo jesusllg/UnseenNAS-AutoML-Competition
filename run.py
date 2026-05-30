@@ -128,25 +128,30 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
     imut     = copy.deepcopy(clock)
 
     # Inject all tunable pipeline params so NAS/Trainer read them from metadata
-    meta['search_frac']   = args.search_frac
-    meta['proxy_epochs']  = args.proxy_epochs
-    meta['proxy_batches'] = args.proxy_batches
-    meta['train_frac']    = args.train_frac
-    meta['weight_decay']  = args.weight_decay
-    meta['es_enabled']     = args.es_enabled
-    meta['es_patience']    = args.es_patience
-    meta['es_min_epochs']  = args.es_min_epochs
-    meta['es_delta_start'] = args.es_delta_start
-    meta['es_delta_min']   = args.es_delta_min
-    meta['es_delta_decay'] = args.es_delta_decay
+    meta['search_frac']      = args.search_frac
+    meta['n_population']     = args.nas_population
+    meta['n_rounds']         = args.nas_rounds
+    meta['tournament_size']  = args.nas_tournament
+    meta['proxy_epochs']     = args.proxy_epochs
+    meta['proxy_batches']    = args.proxy_batches
+    meta['train_frac']       = args.train_frac
+    meta['weight_decay']     = args.weight_decay
+    meta['es_enabled']       = args.es_enabled
+    meta['es_patience']      = args.es_patience
+    meta['es_min_epochs']    = args.es_min_epochs
+    meta['es_delta_start']   = args.es_delta_start
+    meta['es_delta_min']     = args.es_delta_min
+    meta['es_delta_decay']   = args.es_delta_decay
 
     es_str = (f"δ {args.es_delta_start:.5f}↘{args.es_delta_min:.5f}"
               f"/{args.es_delta_decay}↑ p={args.es_patience}") if args.es_enabled else "off"
     print(f"\n{'='*10} {codename:^20} {'='*10}")
     print(f"  time={hours}h | truncate={args.truncate}"
           f" | search={args.search_frac} train={args.train_frac} wd={args.weight_decay:.0e}"
-          f" | proxy {args.proxy_epochs}ep×{args.proxy_batches}b | ES={es_str}")
-    _injected = {'search_frac','proxy_epochs','proxy_batches','train_frac','weight_decay',
+          f" | NAS pop={args.nas_population} rounds={args.nas_rounds} k={args.nas_tournament}"
+          f" | ES={es_str}")
+    _injected = {'search_frac','n_population','n_rounds','tournament_size',
+                 'proxy_epochs','proxy_batches','train_frac','weight_decay',
                  'es_enabled','es_patience','es_min_epochs',
                  'es_delta_start','es_delta_min','es_delta_decay'}
     [print(f"  {k}: {v}") for k, v in meta.items() if k not in _injected]
@@ -215,15 +220,21 @@ def main():
                     help="Root folder containing dataset subdirectories.")
     # ── Pipeline hyperparameters ──────────────────────────────────────────────
     # search_frac + train_frac should sum to ≤ 0.95 (5% buffer for predict/overhead)
-    ap.add_argument("--search-frac",   type=float, default=0.30,
+    ap.add_argument("--search-frac",      type=float, default=0.30,
                     help="Fraction of total budget for NAS search. (default: 0.30)")
-    ap.add_argument("--train-frac",    type=float, default=0.65,
+    ap.add_argument("--train-frac",       type=float, default=0.65,
                     help="Fraction of total budget for final training. (default: 0.65)")
-    ap.add_argument("--proxy-epochs",  type=int,   default=3,
+    ap.add_argument("--nas-population",   type=int,   default=100,
+                    help="NAS population size. (default: 100)")
+    ap.add_argument("--nas-rounds",       type=int,   default=1000,
+                    help="Max NAS evolution rounds (stops at time budget). (default: 1000)")
+    ap.add_argument("--nas-tournament",   type=int,   default=10,
+                    help="NAS tournament size. (default: 10)")
+    ap.add_argument("--proxy-epochs",     type=int,   default=3,
                     help="Training epochs per candidate during proxy eval. (default: 3)")
-    ap.add_argument("--proxy-batches", type=int,   default=40,
+    ap.add_argument("--proxy-batches",    type=int,   default=40,
                     help="Max batches per epoch during proxy eval. (default: 40)")
-    ap.add_argument("--weight-decay",  type=float, default=1e-4,
+    ap.add_argument("--weight-decay",     type=float, default=1e-4,
                     help="AdamW weight decay for final training. (default: 1e-4)")
     # ── Early stopping (dynamic delta) ───────────────────────────────────────
     ap.add_argument("--no-es", dest="es_enabled", action="store_false", default=True,
