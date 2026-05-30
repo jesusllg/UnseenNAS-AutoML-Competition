@@ -79,30 +79,16 @@ class SearchableCNN(nn.Module):
 
 
 _FALLBACK = {
-    'hard':   [(64, 2, 3, True),  (128, 2, 3, True),  (256, 2, 3, True)],
-    'medium': [(64, 2, 3, True),  (128, 2, 3, True),  (256, 1, 3, False)],
-    'easy':   [(32, 2, 3, False), (64,  1, 3, True)],
+    'medium': [(64, 2, 3, True), (128, 2, 3, True), (256, 1, 3, False)],
 }
-
-def _fallback_stages(benchmark):
-    if benchmark is None or float(benchmark) >= 65:
-        return _FALLBACK['medium']
-    return _FALLBACK['easy']
 
 
 # ── Search helpers ────────────────────────────────────────────────────────────
 
-def _search_params(benchmark):
-    """Budget fractions: (search_frac, n_population, n_rounds, tournament_k)."""
-    if benchmark is None:
-        return 0.30, 30, 100, 7
-    b = float(benchmark)
-    if b >= 85:
-        return 0.35, 40, 150, 10
-    elif b >= 65:
-        return 0.30, 30, 100, 7
-    else:
-        return 0.20, 20, 60, 5
+_N_POPULATION    = 30
+_N_ROUNDS        = 100
+_TOURNAMENT_SIZE = 7
+_SEARCH_FRAC     = 0.30
 
 
 def _get_proxy_batch(train_loader, device, batch_size=16):
@@ -132,25 +118,24 @@ class NAS:
         except Exception:
             print("  [NAS] Unexpected error — using fallback architecture.")
             print(traceback.format_exc())
-            in_c      = self.metadata['input_shape'][1]
-            n_cls     = self.metadata['num_classes']
-            hw        = tuple(self.metadata['input_shape'][2:])
-            benchmark = self.metadata.get('benchmark', None)
-            return SearchableCNN(in_c, n_cls, _fallback_stages(benchmark), hw)
+            in_c = self.metadata['input_shape'][1]
+            n_cls = self.metadata['num_classes']
+            hw   = tuple(self.metadata['input_shape'][2:])
+            return SearchableCNN(in_c, n_cls, _FALLBACK['medium'], hw)
 
     def _search(self):
-        shape     = self.metadata['input_shape']
-        in_c      = shape[1]
-        H, W      = shape[2], shape[3]
-        n_cls     = self.metadata['num_classes']
-        benchmark = self.metadata.get('benchmark', None)
+        shape = self.metadata['input_shape']
+        in_c  = shape[1]
+        H, W  = shape[2], shape[3]
+        n_cls = self.metadata['num_classes']
 
-        _sf_default, n_pop, n_rounds, tourney_k = _search_params(benchmark)
-        # run.py can override search_frac; benchmark-derived value is the fallback
-        search_frac   = self.metadata.get('search_frac', _sf_default)
+        n_pop     = self.metadata.get('n_population',    _N_POPULATION)
+        n_rounds  = self.metadata.get('n_rounds',        _N_ROUNDS)
+        tourney_k = self.metadata.get('tournament_size', _TOURNAMENT_SIZE)
+        search_frac   = self.metadata.get('search_frac', _SEARCH_FRAC)
         search_budget = self.clock.check() * search_frac
         t_search_start = time.perf_counter()
-        print(f"  NAS | benchmark={benchmark} sf={search_frac:.2f} → budget={show_time(search_budget)}"
+        print(f"  NAS | sf={search_frac:.2f} → budget={show_time(search_budget)}"
               f"  pop={n_pop} rounds={n_rounds} | device={self.device}")
 
         # ── Import search space ───────────────────────────────────────────────
@@ -161,13 +146,13 @@ class NAS:
             )
         except ImportError as e:
             print(f"  [NAS] search_space import failed ({e}), using legacy fallback.")
-            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+            return self._legacy_search(in_c, n_cls, (H, W))
 
         # ── Proxy batch ───────────────────────────────────────────────────────
         proxy_batch = _get_proxy_batch(self.train_loader, self.device)
         if proxy_batch is None:
             print("  [NAS] Could not get proxy batch — using legacy fallback.")
-            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+            return self._legacy_search(in_c, n_cls, (H, W))
 
         family = infer_family(in_c, H, W, n_cls)
         print(f"  NAS | family={family.name}  aniso={family.is_anisotropic}"
@@ -196,12 +181,12 @@ class NAS:
         except Exception as e:
             print(f"  [NAS] Evolution failed ({e}) — using legacy fallback.")
             traceback.print_exc()
-            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+            return self._legacy_search(in_c, n_cls, (H, W))
 
         best = best_individual(population)
         if best is None:
             print("  [NAS] Empty population — using legacy fallback.")
-            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+            return self._legacy_search(in_c, n_cls, (H, W))
 
         n_evaluated = len(population)
         search_elapsed = time.perf_counter() - t_search_start
@@ -226,7 +211,7 @@ class NAS:
         except Exception as e:
             print(f"  [NAS] Model build failed ({e}) — using legacy fallback.")
             traceback.print_exc()
-            return self._legacy_search(in_c, n_cls, (H, W), benchmark)
+            return self._legacy_search(in_c, n_cls, (H, W))
 
     # ── Legacy search (random + proxy train) ─────────────────────────────────
 
@@ -247,7 +232,7 @@ class NAS:
             ))
         return configs
 
-    def _legacy_search(self, in_c, n_cls, hw, benchmark):
+    def _legacy_search(self, in_c, n_cls, hw):
         budget_frac, proxy_epochs, proxy_batches = 0.25, 3, 40
         search_budget = self.clock.check() * budget_frac
         deadline = time.perf_counter() + search_budget
@@ -275,7 +260,7 @@ class NAS:
                     torch.cuda.empty_cache()
 
         if best_model is None:
-            best_model = SearchableCNN(in_c, n_cls, _fallback_stages(benchmark), hw)
+            best_model = SearchableCNN(in_c, n_cls, _FALLBACK['medium'], hw)
             best_acc = 0.0
         self.metadata.setdefault('nas_report', {
             'n_tried':        n_tried,
