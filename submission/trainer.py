@@ -16,8 +16,16 @@ from helpers import show_time
 
 SEED = 42
 
-_TRAIN_FRAC   = 0.85
+# train_frac is a fraction of the TOTAL clock budget (not of remaining time).
+# search_frac + train_frac should sum to ≤ 0.95, leaving ~5% for predict/overhead.
+_TRAIN_FRAC   = 0.65
+_SEARCH_FRAC  = 0.30   # kept here only as the default denominator reference
 _WEIGHT_DECAY = 1e-4
+
+# Early stopping defaults
+_ES_PATIENCE   = 15
+_ES_MIN_DELTA  = 0.001
+_ES_MIN_EPOCHS = 10
 
 
 def _set_seeds():
@@ -27,6 +35,28 @@ def _set_seeds():
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+class _EarlyStopper:
+    """Prechelt-style patience-based early stopping on validation accuracy."""
+
+    def __init__(self, patience, min_delta, min_epochs):
+        self.patience   = patience
+        self.min_delta  = min_delta
+        self.min_epochs = min_epochs
+        self.best       = -float('inf')
+        self.wait       = 0
+
+    def step(self, val_acc, epoch):
+        """Return True if training should stop."""
+        if epoch < self.min_epochs:
+            return False
+        if val_acc > self.best + self.min_delta:
+            self.best = val_acc
+            self.wait = 0
+        else:
+            self.wait += 1
+        return self.wait >= self.patience
 
 
 class Trainer:
@@ -59,18 +89,30 @@ class Trainer:
         _set_seeds()
         self.model.to(self.device)
 
-        # Read tunable params from metadata (injected by run.py) or use defaults
+        # Complementary fractions of the TOTAL clock budget:
+        #   search_frac takes X% of total at NAS time
+        #   train_frac  is also a fraction of total — we recover it from remaining time
+        search_frac  = self.metadata.get('search_frac',  _SEARCH_FRAC)
         train_frac   = self.metadata.get('train_frac',   _TRAIN_FRAC)
         weight_decay = self.metadata.get('weight_decay', _WEIGHT_DECAY)
 
-        train_budget  = self.clock.check() * train_frac
-        deadline      = time.perf_counter() + train_budget
-        t_train_start = time.perf_counter()
+        # remaining ≈ (1 - search_frac) * total  →  train_budget = train_frac * total
+        remaining_frac = max(1.0 - search_frac, 1e-6)
+        train_budget   = self.clock.check() * (train_frac / remaining_frac)
+        deadline       = time.perf_counter() + train_budget
+        t_train_start  = time.perf_counter()
+
+        # Early stopping
+        es_patience   = self.metadata.get('es_patience',   _ES_PATIENCE)
+        es_min_delta  = self.metadata.get('es_min_delta',  _ES_MIN_DELTA)
+        es_min_epochs = self.metadata.get('es_min_epochs', _ES_MIN_EPOCHS)
+        stopper = _EarlyStopper(es_patience, es_min_delta, es_min_epochs)
 
         n_cls = self.metadata['num_classes']
         label_smoothing = 0.1 if n_cls >= 10 else 0.0
 
-        print(f"  Trainer | budget={show_time(train_budget)} wd={weight_decay:.0e} | device={self.device}")
+        print(f"  Trainer | budget={show_time(train_budget)} wd={weight_decay:.0e}"
+              f" es={es_patience}p/{es_min_epochs}min | device={self.device}")
 
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         optimizer = optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=weight_decay)
@@ -133,6 +175,12 @@ class Trainer:
             if val_acc > best_acc:
                 best_acc   = val_acc
                 best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+
+            if stopper.step(val_acc, epoch):
+                saved = show_time(deadline - time.perf_counter())
+                print(f"  Early stop at epoch {epoch} (patience={es_patience})."
+                      f" ~{saved} returned to pool.")
+                break
 
         if best_state is not None:
             self.model.load_state_dict(best_state)

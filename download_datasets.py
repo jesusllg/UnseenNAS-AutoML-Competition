@@ -266,7 +266,7 @@ def _manual_fallback(name, info, reason):
 # Verification
 # ---------------------------------------------------------------------------
 
-def _verify(name, dataset_dir):
+def _verify(name, dataset_dir, time_limit_hours=None):
     missing = REQUIRED_FILES - {f.name for f in dataset_dir.iterdir()}
     if missing:
         print(f"  ⚠  {name}: missing files: {', '.join(sorted(missing))}")
@@ -284,10 +284,17 @@ def _verify(name, dataset_dir):
         print(f"  ⚠  {name}: metadata unreadable: {e}")
         return False
 
-    tl = meta.get('time_limit', 'not set — run.py will use 0.5h default')
+    # Always write time_limit into the metadata JSON so the competition runner picks it up
+    if time_limit_hours is not None:
+        meta['time_limit'] = time_limit_hours
+    elif 'time_limit' not in meta:
+        meta['time_limit'] = 0.5
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    tl = meta['time_limit']
     print(f"  ✓  {name}: OK  (codename={meta['codename']!r}"
           f"  classes={meta['num_classes']}  shape={meta['input_shape']}"
-          f"  time_limit={tl})")
+          f"  time_limit={tl}h)")
     return True
 
 
@@ -308,6 +315,11 @@ def main():
                         help="Output directory (default: datasets/).")
     parser.add_argument("--skip-existing", action="store_true", default=True,
                         help="Skip datasets that already look complete.")
+    parser.add_argument("--time-limit", type=float, default=None, metavar="HOURS",
+                        help="Write this time_limit into each dataset's metadata JSON. "
+                             "Default: keep existing value or set 0.5h if absent.")
+    parser.add_argument("--patch-time-limit", action="store_true",
+                        help="Only patch time_limit in existing datasets (no download).")
     args = parser.parse_args()
 
     if args.list:
@@ -326,6 +338,19 @@ def main():
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    tl = args.time_limit  # may be None → _verify keeps existing or sets 0.5h
+
+    # ── patch-only mode: just rewrite time_limit in existing metadata ──────────
+    if args.patch_time_limit:
+        print(f"Patching time_limit={tl if tl is not None else '(keep/default 0.5h)'} in existing datasets\n")
+        for name in targets:
+            dest = out_root / name
+            if not dest.exists() or not (dest / "metadata").exists():
+                print(f"  ⚠  {name}: not found at {dest}")
+                continue
+            _verify(name, dest, time_limit_hours=tl)
+        return
+
     session, backend = _make_session()
     print(f"HTTP backend: {backend}")
     print(f"Output dir:   {out_root.resolve()}\n")
@@ -340,8 +365,8 @@ def main():
         if args.skip_existing:
             existing = {f.name for f in dest.iterdir()} if dest.exists() else set()
             if REQUIRED_FILES.issubset(existing):
-                print(f"[{name}] already present — skipping. (delete folder to re-download)")
-                results[name] = True
+                print(f"[{name}] already present — patching time_limit and skipping re-download.")
+                results[name] = _verify(name, dest, time_limit_hours=tl)
                 continue
 
         print(f"\n[{name}]  ({info['host'].upper()}  DOI: {info['doi']})")
@@ -349,11 +374,11 @@ def main():
         try:
             if info["host"] == "ncl":
                 _download_ncl(name, info, dest, session)
-                ok = _verify(name, dest)
+                ok = _verify(name, dest, time_limit_hours=tl)
             else:
                 ok = _download_edinburgh(name, info, dest, session)
                 if ok:
-                    ok = _verify(name, dest)
+                    ok = _verify(name, dest, time_limit_hours=tl)
         except Exception as e:
             _manual_fallback(name, info, str(e))
             ok = False

@@ -9,8 +9,14 @@ Usage:
   python run.py                          # run all datasets in datasets/
   python run.py --dataset AddNIST        # run one specific dataset
   python run.py --dataset AddNIST MultNIST  # run several
-  python run.py --time 0.25             # override time limit (hours)
+  python run.py --time 0.25             # override time limit per dataset (hours)
+  python run.py --total-time 24         # global pool shared across datasets
   python run.py --truncate              # quick smoke-test (64 samples)
+
+Time budget modes (mutually exclusive):
+  --time HOURS        Fixed per-dataset time limit (overrides metadata).
+  --total-time HOURS  Global pool; each dataset gets pool/remaining datasets,
+                      with --min-time as a floor. Saved time is redistributed.
 """
 
 import argparse
@@ -58,6 +64,35 @@ class Clock:
         return self.limit - time.perf_counter()
 
 
+class GlobalTimeBudget:
+    """
+    Dynamically redistributes a total time pool across datasets.
+
+    Each dataset gets at least min_seconds; unused time flows to the rest.
+    Call next_allocation() before each dataset, then record_usage() after.
+    """
+
+    def __init__(self, total_hours, n_datasets, min_hours=0.1):
+        self.pool        = total_hours * 3600   # seconds remaining
+        self.n_remaining = n_datasets
+        self.min_s       = min_hours * 3600
+
+    def next_allocation(self):
+        if self.n_remaining <= 0:
+            return self.min_s
+        per = self.pool / self.n_remaining
+        return max(per, self.min_s)
+
+    def record_usage(self, used_seconds):
+        self.pool        = max(0.0, self.pool - used_seconds)
+        self.n_remaining = max(0,   self.n_remaining - 1)
+        if self.n_remaining > 0:
+            carry = self.pool / self.n_remaining
+            print(f"  [Budget] used={show_time(used_seconds)}"
+                  f"  pool={show_time(self.pool)}"
+                  f"  ~{show_time(carry)}/dataset remaining")
+
+
 def load_metadata(dataset_path: Path) -> dict:
     return json.loads((dataset_path / "metadata").read_text())
 
@@ -85,27 +120,31 @@ def fail_dataset(codename, pred_dir):
 
 # ── per-dataset run ───────────────────────────────────────────────────────────
 
-def run_one(dataset_path: Path, args, pred_dir: Path):
-    meta = load_metadata(dataset_path)
+def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
+    """Run the full pipeline for one dataset. Returns (ok, runtime_seconds)."""
+    meta     = load_metadata(dataset_path)
     codename = meta["codename"]
+    clock    = Clock(hours)
+    imut     = copy.deepcopy(clock)
 
-    # Time limit: CLI --time > metadata field > default 0.5 h
-    hours = args.time if args.time is not None else meta.get("time_limit", 0.5)
-    clock = Clock(hours)
-    imut  = copy.deepcopy(clock)
-
-    # Inject tunable pipeline params into metadata so NAS/Trainer can read them
+    # Inject all tunable pipeline params so NAS/Trainer read them from metadata
     meta['search_frac']   = args.search_frac
     meta['proxy_epochs']  = args.proxy_epochs
     meta['proxy_batches'] = args.proxy_batches
     meta['train_frac']    = args.train_frac
     meta['weight_decay']  = args.weight_decay
+    meta['es_patience']   = args.es_patience
+    meta['es_min_delta']  = args.es_min_delta
+    meta['es_min_epochs'] = args.es_min_epochs
 
     print(f"\n{'='*10} {codename:^20} {'='*10}")
     print(f"  time={hours}h | truncate={args.truncate}"
           f" | search_frac={args.search_frac} proxy={args.proxy_epochs}ep×{args.proxy_batches}b"
-          f" | train_frac={args.train_frac} wd={args.weight_decay:.0e}")
-    [print(f"  {k}: {v}") for k, v in meta.items()]
+          f" | train_frac={args.train_frac} wd={args.weight_decay:.0e}"
+          f" | ES patience={args.es_patience}")
+    [print(f"  {k}: {v}") for k, v in meta.items()
+     if k not in ('search_frac','proxy_epochs','proxy_batches','train_frac',
+                  'weight_decay','es_patience','es_min_delta','es_min_epochs')]
 
     t0 = time.perf_counter()
     try:
@@ -140,13 +179,14 @@ def run_one(dataset_path: Path, args, pred_dir: Path):
         pkl.dump({'Failed': False, 'Runtime': round(runtime, 2), 'Params': params},
                  open(pred_dir / f"{codename}_stats.pkl", "wb"))
         print(f"  Done in {show_time(runtime)} | params={params:,}")
-        return True
+        return True, runtime
 
     except Exception:
+        runtime = time.perf_counter() - t0
         print(f"\n  [ERROR] {codename} failed:")
         print(traceback.format_exc())
         fail_dataset(codename, pred_dir)
-        return False
+        return False, runtime
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -156,28 +196,50 @@ def main():
     ap.add_argument("--dataset", nargs="*", metavar="NAME",
                     help="Dataset folder name(s) to run. Default: all in datasets/.")
     ap.add_argument("--time", type=float, metavar="HOURS",
-                    help="Override time limit for every dataset (hours). "
+                    help="Fixed time limit per dataset (hours). "
                          "Default: use metadata field, fallback 0.5h.")
+    ap.add_argument("--total-time", type=float, metavar="HOURS",
+                    help="Global time pool (hours) shared across all datasets. "
+                         "Unused time flows to remaining datasets. "
+                         "Mutually exclusive with --time.")
+    ap.add_argument("--min-time", type=float, default=0.1, metavar="HOURS",
+                    help="Floor time per dataset when using --total-time. (default: 0.1h)")
     ap.add_argument("--truncate", action="store_true",
                     help="Use only 64 samples per split (quick smoke-test).")
     ap.add_argument("--datasets-dir", default="datasets", metavar="DIR",
                     help="Root folder containing dataset subdirectories.")
     # ── Pipeline hyperparameters ──────────────────────────────────────────────
+    # search_frac + train_frac should sum to ≤ 0.95 (5% buffer for predict/overhead)
     ap.add_argument("--search-frac",   type=float, default=0.30,
-                    help="Fraction of time budget allocated to NAS search. (default: 0.30)")
+                    help="Fraction of total budget for NAS search. (default: 0.30)")
+    ap.add_argument("--train-frac",    type=float, default=0.65,
+                    help="Fraction of total budget for final training. (default: 0.65)")
     ap.add_argument("--proxy-epochs",  type=int,   default=3,
-                    help="Training epochs per candidate architecture during proxy eval. (default: 3)")
+                    help="Training epochs per candidate during proxy eval. (default: 3)")
     ap.add_argument("--proxy-batches", type=int,   default=40,
                     help="Max batches per epoch during proxy eval. (default: 40)")
-    ap.add_argument("--train-frac",    type=float, default=0.85,
-                    help="Fraction of remaining time allocated to final training. (default: 0.85)")
     ap.add_argument("--weight-decay",  type=float, default=1e-4,
                     help="AdamW weight decay for final training. (default: 1e-4)")
+    # ── Early stopping ────────────────────────────────────────────────────────
+    ap.add_argument("--es-patience",   type=int,   default=15,
+                    help="Early stopping: epochs without improvement before stopping. (default: 15)")
+    ap.add_argument("--es-min-delta",  type=float, default=0.001,
+                    help="Early stopping: minimum improvement to reset patience. (default: 0.001)")
+    ap.add_argument("--es-min-epochs", type=int,   default=10,
+                    help="Early stopping: minimum epochs before stopping is allowed. (default: 10)")
     args = ap.parse_args()
+
+    # Validate fractions
+    if args.search_frac + args.train_frac > 0.95:
+        print(f"WARNING: search_frac ({args.search_frac}) + train_frac ({args.train_frac})"
+              f" = {args.search_frac + args.train_frac:.2f} > 0.95 — little time left for predict/overhead.")
+    if args.time is not None and args.total_time is not None:
+        print("ERROR: --time and --total-time are mutually exclusive.")
+        sys.exit(1)
 
     datasets_dir = Path(args.datasets_dir)
     pred_dir     = Path("predictions")
-    pred_dir.mkdir(exist_ok=True)         # auto-create — no more missing folder errors
+    pred_dir.mkdir(exist_ok=True)
 
     if not datasets_dir.exists():
         print(f"ERROR: datasets directory not found: {datasets_dir}")
@@ -208,10 +270,30 @@ def main():
 
     print(f"Running {len(targets)} dataset(s): {[p.name for p in targets]}")
 
+    # ── Time budget setup ─────────────────────────────────────────────────────
+    budget = None
+    if args.total_time is not None:
+        budget = GlobalTimeBudget(args.total_time, len(targets), args.min_time)
+        print(f"Global budget: {args.total_time}h total"
+              f" | min {args.min_time}h/dataset"
+              f" | ~{args.total_time/len(targets):.2f}h/dataset initially")
+
     results = {}
     for ds_path in targets:
-        ok = run_one(ds_path, args, pred_dir)
+        # Determine time allocation for this dataset
+        if budget is not None:
+            hours = budget.next_allocation() / 3600
+        elif args.time is not None:
+            hours = args.time
+        else:
+            meta_preview = load_metadata(ds_path)
+            hours = meta_preview.get("time_limit", 0.5)
+
+        ok, runtime = run_one(ds_path, args, pred_dir, hours)
         results[ds_path.name] = ok
+
+        if budget is not None:
+            budget.record_usage(runtime)
 
     # ── Summary table ──────────────────────────────────────────────────
     print(f"\n{'='*60}")
