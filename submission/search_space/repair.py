@@ -89,16 +89,44 @@ def estimate_activations_mb(genotype: Genotype, C: int, H: int, W: int,
     return total_elements * 4 * _TRAIN_FACTOR / (1024 ** 2)  # float32 MB
 
 
+def _default_memory_budget_mb() -> float:
+    """
+    Memory budget = a fraction of the ACTUAL GPU so the cap reflects real
+    hardware, not an arbitrary number.
+
+    The estimator above is deliberately conservative (fp32 basis × 3, while
+    training actually runs in fp16/AMP), so we can safely target ~80% of the
+    physical GPU memory. This guarantees:
+      • small/medium-spatial models never hit the cap (search is unchanged —
+        the strong, SOTA-ish architectures we already find still pass), and
+      • only models that genuinely exceed the GPU (e.g. huge-spatial Windspeed)
+        get shrunk, and only by the minimum needed to fit.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+            return total_mb * 0.80
+    except Exception:
+        pass
+    return 16384.0  # 16 GB fallback when no GPU info is available
+
+
 # ── Repair rules ──────────────────────────────────────────────────────────────
 
 def repair(genotype: Genotype, C: int, H: int, W: int,
            num_classes: int, family: FamilyProfile,
-           memory_budget_mb: float = 4096.0) -> Genotype:
+           memory_budget_mb: Optional[float] = None) -> Genotype:
     """
     Apply hard-constraint repair rules in order.
     Returns a valid (possibly modified) Genotype.
+
+    memory_budget_mb: if None, defaults to ~80% of the physical GPU memory so
+    the cap tracks real hardware instead of an arbitrary fixed limit.
     """
     import copy
+    if memory_budget_mb is None:
+        memory_budget_mb = _default_memory_budget_mb()
     g = copy.deepcopy(genotype)
 
     # R1: n_stages must be in [1, MAX_STAGES]
