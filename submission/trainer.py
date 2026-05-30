@@ -42,25 +42,29 @@ def _set_seeds():
 
 class _EarlyStopper:
     """
-    Dynamic-delta early stopping.
+    Cumulative early stopping with dynamic delta.
 
-    Delta starts at delta_start and halves every time we see delta_decay
-    consecutive improving epochs — making the bar progressively stricter.
-    If val_acc doesn't clear (best + delta) for `patience` epochs in a row,
-    training stops.  Disabled entirely when enabled=False.
+    `wait` counts total epochs where val_acc <= best + delta (not consecutive).
+    On a good epoch (val > best + delta), best is updated but wait stays.
+    On a bad epoch, wait increments by 1.
+    Stops when total bad epochs reach `patience`.
+
+    Delta decays every `delta_decay` total improvements, making the bar
+    progressively stricter over time (finer-grained progress detection).
+    Disabled entirely when enabled=False.
     """
 
     def __init__(self, patience, min_epochs, delta_start, delta_min,
                  delta_decay, enabled):
-        self.patience       = patience
-        self.min_epochs     = min_epochs
-        self.delta          = delta_start
-        self.delta_min      = delta_min
-        self.delta_decay    = delta_decay
-        self.enabled        = enabled
-        self.best           = -float('inf')
-        self.wait           = 0
-        self.improve_streak = 0
+        self.patience      = patience
+        self.min_epochs    = min_epochs
+        self.delta         = delta_start
+        self.delta_min     = delta_min
+        self.delta_decay   = delta_decay
+        self.enabled       = enabled
+        self.best          = -float('inf')
+        self.wait          = 0   # cumulative bad epochs
+        self.improve_count = 0   # total improvements (for delta decay)
 
     def step(self, val_acc, epoch):
         """Return True if training should stop."""
@@ -69,19 +73,16 @@ class _EarlyStopper:
 
         if val_acc > self.best + self.delta:
             self.best = val_acc
-            self.wait = 0
-            self.improve_streak += 1
-            # Tighten the bar after a run of consecutive improvements
-            if self.improve_streak >= self.delta_decay:
+            self.improve_count += 1
+            # Tighten the bar every delta_decay total improvements
+            if self.improve_count % self.delta_decay == 0:
                 old = self.delta
                 self.delta = max(self.delta * 0.5, self.delta_min)
-                self.improve_streak = 0
                 if self.delta < old:
                     print(f"  [ES] Δ {old:.5f}→{self.delta:.5f} "
-                          f"(after {self.delta_decay} improvements)")
+                          f"({self.improve_count} improvements)")
         else:
             self.wait += 1
-            self.improve_streak = 0
 
         return self.wait >= self.patience
 
