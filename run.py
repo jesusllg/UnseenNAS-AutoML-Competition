@@ -140,12 +140,13 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
     meta['es_enabled']       = args.es_enabled
     meta['es_patience']      = args.es_patience
     meta['es_min_epochs']    = args.es_min_epochs
-    meta['es_delta_start']   = args.es_delta_start
-    meta['es_delta_min']     = args.es_delta_min
-    meta['es_delta_decay']   = args.es_delta_decay
+    meta['es_delta_start']      = args.es_delta_start
+    meta['es_delta_min']        = args.es_delta_min
+    meta['es_delta_decay']      = args.es_delta_decay
+    meta['es_regression_delta'] = args.es_regression_delta
 
-    es_str = (f"δ {args.es_delta_start:.5f}↘{args.es_delta_min:.5f}"
-              f"/{args.es_delta_decay}↑ p={args.es_patience}") if args.es_enabled else "off"
+    es_str = (f"↑δ{args.es_delta_start:.4f}↘{args.es_delta_min:.4f} "
+              f"↓{args.es_regression_delta:.4f} p={args.es_patience}") if args.es_enabled else "off"
     print(f"\n{'='*10} {codename:^20} {'='*10}")
     print(f"  time={hours}h | truncate={args.truncate}"
           f" | search={args.search_frac} train={args.train_frac} wd={args.weight_decay:.0e}"
@@ -154,7 +155,7 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
     _injected = {'seed','search_frac','n_population','n_rounds','tournament_size',
                  'proxy_epochs','proxy_batches','train_frac','weight_decay',
                  'es_enabled','es_patience','es_min_epochs',
-                 'es_delta_start','es_delta_min','es_delta_decay'}
+                 'es_delta_start','es_delta_min','es_delta_decay','es_regression_delta'}
     [print(f"  {k}: {v}") for k, v in meta.items() if k not in _injected]
 
     t0 = time.perf_counter()
@@ -184,10 +185,22 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
 
         print("\n=== Predict ===")
         preds = trainer.predict(test_loader)
+        np.save(pred_dir / f"{codename}.npy", preds)
+
+        # Auto test accuracy if test_y.npy available (local evaluation only)
+        test_acc = None
+        test_y_path = dataset_path / "test_y.npy"
+        if test_y_path.exists():
+            test_y = np.load(test_y_path)
+            if args.truncate:
+                test_y = test_y[:64]
+            test_acc = float((np.array(preds) == test_y.reshape(-1)).mean())
+            print(f"  Test accuracy: {test_acc*100:.4f}%  (test_y found — local eval only)")
+            meta['test_acc'] = round(test_acc, 4)
 
         runtime = time.perf_counter() - t0
-        np.save(pred_dir / f"{codename}.npy", preds)
-        pkl.dump({'Failed': False, 'Runtime': round(runtime, 2), 'Params': params},
+        pkl.dump({'Failed': False, 'Runtime': round(runtime, 2), 'Params': params,
+                  'TestAcc': test_acc},
                  open(pred_dir / f"{codename}_stats.pkl", "wb"))
         print(f"  Done in {show_time(runtime)} | params={params:,}")
         return True, runtime
@@ -250,8 +263,10 @@ def main():
                     help="Initial min-improvement threshold. (default: 0.005 = 0.5pp)")
     ap.add_argument("--es-delta-min",    type=float, default=0.001,
                     help="Floor for delta after decay. (default: 0.001 = 0.1pp)")
-    ap.add_argument("--es-delta-decay",  type=int,   default=5,
+    ap.add_argument("--es-delta-decay",       type=int,   default=5,
                     help="Improvements before halving delta. (default: 5)")
+    ap.add_argument("--es-regression-delta", type=float, default=0.010,
+                    help="Fall >X below best to count as bad epoch. (default: 0.010 = 1pp)")
     args = ap.parse_args()
 
     # Validate fractions
@@ -327,18 +342,20 @@ def main():
             budget.record_usage(runtime)
 
     # ── Summary table ──────────────────────────────────────────────────
-    print(f"\n{'='*72}")
-    print(f"{'DATASET':<20} {'STATUS':<10} {'PARAMS':>10} {'RUNTIME':>10} {'TRAIN':>8} {'VAL':>8}")
-    print(f"{'-'*72}")
+    print(f"\n{'='*82}")
+    print(f"{'DATASET':<20} {'STATUS':<10} {'PARAMS':>10} {'RUNTIME':>10} {'TRAIN':>8} {'VAL':>8} {'TEST':>8}")
+    print(f"{'-'*82}")
     for ds_name, ok in results.items():
         codename = load_metadata(datasets_dir / ds_name).get("codename", ds_name)
         stats_path = pred_dir / f"{codename}_stats.pkl"
+        params = runtime = "N/A"
+        test_str = "—"
         if stats_path.exists():
             s = pkl.load(open(stats_path, "rb"))
             params   = f"{s['Params']:,}" if s['Params'] else "N/A"
             runtime  = show_time(s['Runtime']) if s['Runtime'] >= 0 else "N/A"
-        else:
-            params = runtime = "N/A"
+            if s.get('TestAcc') is not None:
+                test_str = f"{s['TestAcc']*100:.2f}%"
 
         report_path = pred_dir / f"{codename}_report.json"
         train_str = val_str = "N/A"
@@ -348,14 +365,14 @@ def main():
                 train_str = f"{float(r['final_train_acc'])*100:.2f}%"
             if 'final_val_acc' in r:
                 val_str = f"{float(r['final_val_acc'])*100:.2f}%"
-            elif 'best_val_acc' in r:  # backwards compat
+            elif 'best_val_acc' in r:
                 val_str = f"{float(r['best_val_acc'])*100:.2f}%"
 
         status = "✓ OK" if ok else "✗ FAIL"
-        print(f"{ds_name:<20} {status:<10} {params:>10} {runtime:>10} {train_str:>8} {val_str:>8}")
+        print(f"{ds_name:<20} {status:<10} {params:>10} {runtime:>10} {train_str:>8} {val_str:>8} {test_str:>8}")
 
     n_ok = sum(results.values())
-    print(f"{'='*72}")
+    print(f"{'='*82}")
     print(f"Completed: {n_ok}/{len(results)} datasets")
 
 
