@@ -279,12 +279,20 @@ def _verify(name, dataset_dir):
         if not needed.issubset(meta.keys()):
             print(f"  ⚠  {name}: metadata missing keys: {needed - meta.keys()}")
             return False
+
+        # Inject time_limit if absent — framework defaults to 0.5h but prints a warning
+        if "time_limit" not in meta:
+            meta["time_limit"] = 0.5
+            meta_path.write_text(json.dumps(meta, indent=2))
+            print(f"  ↳  injected time_limit=0.5 into metadata")
+
     except Exception as e:
         print(f"  ⚠  {name}: metadata unreadable: {e}")
         return False
 
     print(f"  ✓  {name}: OK  (codename={meta['codename']!r}"
-          f"  classes={meta['num_classes']}  shape={meta['input_shape']})")
+          f"  classes={meta['num_classes']}  shape={meta['input_shape']}"
+          f"  time_limit={meta.get('time_limit')}h)")
     return True
 
 
