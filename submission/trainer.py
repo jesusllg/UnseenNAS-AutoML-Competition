@@ -147,6 +147,7 @@ class Trainer:
         scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
 
         best_acc   = 0.0
+        best_epoch = 0
         best_state = None
         epoch_times: list[float] = []
         epoch = 0
@@ -193,30 +194,33 @@ class Trainer:
             val_acc   = self._evaluate(self.valid_dl)
             lr_now    = scheduler.get_last_lr()[0]
 
-            print("  Epoch {:>3} | Train {:>6.2f}% | Val {:>6.2f}% | {} | lr {:.2e}".format(
+            marker = " ★" if val_acc > best_acc else ""
+            print("  Epoch {:>3} | Train {:>6.2f}% | Val {:>6.2f}% | {} | lr {:.2e}{}".format(
                 epoch, train_acc * 100, val_acc * 100,
-                show_time(epoch_times[-1]), lr_now))
+                show_time(epoch_times[-1]), lr_now, marker))
 
             if val_acc > best_acc:
                 best_acc   = val_acc
+                best_epoch = epoch
                 best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
 
             if stopper.step(val_acc, epoch):
                 saved = show_time(max(0.0, deadline - time.perf_counter()))
                 print(f"  Early stop at epoch {epoch} "
-                      f"(plateau {es_patience} ep, Δ={stopper.delta:.5f})."
+                      f"(wait={stopper.wait}/{es_patience}, Δ={stopper.delta:.5f})."
                       f" ~{saved} returned to pool.")
                 break
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
+            print(f"  ← Restored best weights from epoch {best_epoch} (val={best_acc*100:.2f}%)")
 
         # Final evaluation with best weights
         final_val_acc   = self._evaluate(self.valid_dl)
         final_train_acc = self._evaluate(self.train_dl)
         print(f"  {'─'*55}")
         print(f"  Final | Train {final_train_acc*100:.2f}% | Val {final_val_acc*100:.2f}%"
-              f"  (best val seen: {best_acc*100:.2f}%)")
+              f"  (best epoch: {best_epoch})")
         print(f"  {'─'*55}")
 
         train_elapsed = time.perf_counter() - t_train_start
