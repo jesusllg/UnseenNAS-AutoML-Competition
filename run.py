@@ -207,7 +207,7 @@ def main():
                     help="Dataset folder name(s) to run. Default: all in datasets/.")
     ap.add_argument("--time", type=float, metavar="HOURS",
                     help="Fixed time limit per dataset (hours). "
-                         "Default: use metadata field, fallback 0.5h.")
+                         "Default: use metadata field, fallback 7h.")
     ap.add_argument("--total-time", type=float, metavar="HOURS",
                     help="Global time pool (hours) shared across all datasets. "
                          "Unused time flows to remaining datasets. "
@@ -315,7 +315,7 @@ def main():
             hours = args.time
         else:
             meta_preview = load_metadata(ds_path)
-            hours = meta_preview.get("time_limit", 0.5)
+            hours = meta_preview.get("time_limit", 7.0)
 
         ok, runtime = run_one(ds_path, args, pred_dir, hours)
         results[ds_path.name] = ok
