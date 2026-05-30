@@ -115,18 +115,19 @@ def _sample_stage_configs(rng, n_stages):
 
 # ── Proxy (fast) evaluation ────────────────────────────────────────────────────
 
+# Defaults — overridable via metadata keys injected by run.py
 _PROXY_EPOCHS  = 3
 _PROXY_BATCHES = 40
 _SEARCH_FRAC   = 0.30
 
 
-def _proxy_train(model, loader, device):
+def _proxy_train(model, loader, device, n_epochs, max_batches):
     model.to(device).train()
     opt  = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
-    for _ in range(_PROXY_EPOCHS):
+    for _ in range(n_epochs):
         for i, (x, y) in enumerate(loader):
-            if i >= _PROXY_BATCHES:
+            if i >= max_batches:
                 break
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
@@ -179,12 +180,17 @@ class NAS:
         n_cls = self.metadata['num_classes']
         hw    = tuple(self.metadata['input_shape'][2:])
 
-        search_budget = self.clock.check() * _SEARCH_FRAC
-        deadline      = time.perf_counter() + search_budget
+        # Read tunable params from metadata (injected by run.py) or use defaults
+        search_frac   = self.metadata.get('search_frac',   _SEARCH_FRAC)
+        proxy_epochs  = self.metadata.get('proxy_epochs',  _PROXY_EPOCHS)
+        proxy_batches = self.metadata.get('proxy_batches', _PROXY_BATCHES)
+
+        search_budget  = self.clock.check() * search_frac
+        deadline       = time.perf_counter() + search_budget
         t_search_start = time.perf_counter()
 
         print(f"  NAS | budget={show_time(search_budget)}"
-              f" proxy={_PROXY_EPOCHS}ep×{_PROXY_BATCHES}b | device={self.device}")
+              f" proxy={proxy_epochs}ep×{proxy_batches}b | device={self.device}")
 
         rng = np.random.RandomState(SEED)
         best_model, best_acc, best_stages = None, -1.0, _FALLBACK_STAGES
@@ -196,7 +202,8 @@ class NAS:
 
             try:
                 model = SearchableCNN(in_c, n_cls, stage_cfg, hw)
-                model = _proxy_train(model, self.train_loader, self.device)
+                model = _proxy_train(model, self.train_loader, self.device,
+                                     proxy_epochs, proxy_batches)
                 acc   = _proxy_acc(model, self.valid_loader, self.device)
                 n_tried += 1
                 marker = " ★" if acc > best_acc else ""

@@ -59,17 +59,21 @@ class Trainer:
         _set_seeds()
         self.model.to(self.device)
 
-        train_budget = self.clock.check() * _TRAIN_FRAC
-        deadline     = time.perf_counter() + train_budget
+        # Read tunable params from metadata (injected by run.py) or use defaults
+        train_frac   = self.metadata.get('train_frac',   _TRAIN_FRAC)
+        weight_decay = self.metadata.get('weight_decay', _WEIGHT_DECAY)
+
+        train_budget  = self.clock.check() * train_frac
+        deadline      = time.perf_counter() + train_budget
         t_train_start = time.perf_counter()
 
         n_cls = self.metadata['num_classes']
         label_smoothing = 0.1 if n_cls >= 10 else 0.0
 
-        print(f"  Trainer | budget={show_time(train_budget)} | device={self.device}")
+        print(f"  Trainer | budget={show_time(train_budget)} wd={weight_decay:.0e} | device={self.device}")
 
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=_WEIGHT_DECAY)
+        optimizer = optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=weight_decay)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200, eta_min=1e-5)
 
         use_amp = torch.cuda.is_available()

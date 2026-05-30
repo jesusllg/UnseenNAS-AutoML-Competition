@@ -85,23 +85,31 @@ def fail_dataset(codename, pred_dir):
 
 # ── per-dataset run ───────────────────────────────────────────────────────────
 
-def run_one(dataset_path: Path, time_override: float | None, truncate: bool,
-            pred_dir: Path):
+def run_one(dataset_path: Path, args, pred_dir: Path):
     meta = load_metadata(dataset_path)
     codename = meta["codename"]
 
-    # Time limit: CLI override > metadata field > default 0.5 h
-    hours = time_override if time_override is not None else meta.get("time_limit", 0.5)
+    # Time limit: CLI --time > metadata field > default 0.5 h
+    hours = args.time if args.time is not None else meta.get("time_limit", 0.5)
     clock = Clock(hours)
     imut  = copy.deepcopy(clock)
 
+    # Inject tunable pipeline params into metadata so NAS/Trainer can read them
+    meta['search_frac']   = args.search_frac
+    meta['proxy_epochs']  = args.proxy_epochs
+    meta['proxy_batches'] = args.proxy_batches
+    meta['train_frac']    = args.train_frac
+    meta['weight_decay']  = args.weight_decay
+
     print(f"\n{'='*10} {codename:^20} {'='*10}")
-    print(f"  time_limit={hours}h | truncate={truncate}")
+    print(f"  time={hours}h | truncate={args.truncate}"
+          f" | search_frac={args.search_frac} proxy={args.proxy_epochs}ep×{args.proxy_batches}b"
+          f" | train_frac={args.train_frac} wd={args.weight_decay:.0e}")
     [print(f"  {k}: {v}") for k, v in meta.items()]
 
     t0 = time.perf_counter()
     try:
-        train_x, train_y, valid_x, valid_y, test_x = load_dataset(dataset_path, truncate)
+        train_x, train_y, valid_x, valid_y, test_x = load_dataset(dataset_path, args.truncate)
         meta["time_remaining"] = imut.check()
 
         print("\n=== DataProcessor ===")
@@ -148,11 +156,23 @@ def main():
     ap.add_argument("--dataset", nargs="*", metavar="NAME",
                     help="Dataset folder name(s) to run. Default: all in datasets/.")
     ap.add_argument("--time", type=float, metavar="HOURS",
-                    help="Override time limit for every dataset (hours).")
+                    help="Override time limit for every dataset (hours). "
+                         "Default: use metadata field, fallback 0.5h.")
     ap.add_argument("--truncate", action="store_true",
                     help="Use only 64 samples per split (quick smoke-test).")
     ap.add_argument("--datasets-dir", default="datasets", metavar="DIR",
                     help="Root folder containing dataset subdirectories.")
+    # ── Pipeline hyperparameters ──────────────────────────────────────────────
+    ap.add_argument("--search-frac",   type=float, default=0.30,
+                    help="Fraction of time budget allocated to NAS search. (default: 0.30)")
+    ap.add_argument("--proxy-epochs",  type=int,   default=3,
+                    help="Training epochs per candidate architecture during proxy eval. (default: 3)")
+    ap.add_argument("--proxy-batches", type=int,   default=40,
+                    help="Max batches per epoch during proxy eval. (default: 40)")
+    ap.add_argument("--train-frac",    type=float, default=0.85,
+                    help="Fraction of remaining time allocated to final training. (default: 0.85)")
+    ap.add_argument("--weight-decay",  type=float, default=1e-4,
+                    help="AdamW weight decay for final training. (default: 1e-4)")
     args = ap.parse_args()
 
     datasets_dir = Path(args.datasets_dir)
@@ -190,7 +210,7 @@ def main():
 
     results = {}
     for ds_path in targets:
-        ok = run_one(ds_path, args.time, args.truncate, pred_dir)
+        ok = run_one(ds_path, args, pred_dir)
         results[ds_path.name] = ok
 
     # ── Summary table ──────────────────────────────────────────────────
