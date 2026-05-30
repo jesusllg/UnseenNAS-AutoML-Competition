@@ -143,24 +143,66 @@ def _download_ncl(name, info, dest_dir, session):
     print(f"  URL: {url}")
     raw = _download_bytes(url, session, label=name)
 
-    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        members = zf.namelist()
-        for member in members:
-            fname = Path(member).name
-            if fname in REQUIRED_FILES or fname.endswith(".npy"):
-                zf.extract(member, dest_dir)
-                extracted = dest_dir / member
-                final = dest_dir / fname
-                if extracted != final:
-                    final.parent.mkdir(parents=True, exist_ok=True)
-                    extracted.rename(final)
+    # Try as ZIP first; some NCL articles serve individual files instead
+    if zipfile.is_zipfile(io.BytesIO(raw)):
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            members = zf.namelist()
+            for member in members:
+                fname = Path(member).name
+                if fname in REQUIRED_FILES or fname.endswith(".npy"):
+                    zf.extract(member, dest_dir)
+                    extracted = dest_dir / member
+                    final = dest_dir / fname
+                    if extracted != final:
+                        final.parent.mkdir(parents=True, exist_ok=True)
+                        extracted.rename(final)
 
-    # Clean up any subdirectories left behind by the ZIP
-    for item in dest_dir.iterdir():
-        if item.is_dir():
-            for sub in item.iterdir():
-                sub.rename(dest_dir / sub.name)
-            item.rmdir()
+        # Clean up any subdirectories left behind by the ZIP
+        for item in dest_dir.iterdir():
+            if item.is_dir():
+                for sub in item.iterdir():
+                    sub.rename(dest_dir / sub.name)
+                try:
+                    item.rmdir()
+                except OSError:
+                    pass
+    else:
+        # Not a zip — fall back to figshare v2 API to fetch individual files
+        print(f"  Not a zip — trying figshare v2 API for individual files…")
+        _download_ncl_via_api(name, info, dest_dir, session)
+
+
+def _download_ncl_via_api(name, info, dest_dir, session):
+    """Download individual dataset files using the figshare v2 REST API."""
+    api_url = f"https://api.figshare.com/v2/articles/{info['ncl_id']}/files"
+    print(f"  API: {api_url}")
+
+    try:
+        raw_meta = _download_bytes(api_url, session, label=f"{name}-api")
+        files_meta = json.loads(raw_meta)
+    except Exception as e:
+        raise RuntimeError(f"figshare API call failed: {e}")
+
+    if not isinstance(files_meta, list) or len(files_meta) == 0:
+        raise RuntimeError("figshare API returned no files")
+
+    downloaded = 0
+    for file_info in files_meta:
+        fname = file_info.get("name", "")
+        dl_url = file_info.get("download_url", "")
+        if not dl_url:
+            dl_url = file_info.get("downloadUrl", "")
+        if fname in REQUIRED_FILES or fname.endswith(".npy"):
+            print(f"  Downloading file: {fname}")
+            data = _download_bytes(dl_url, session, label=fname)
+            (dest_dir / fname).write_bytes(data)
+            downloaded += 1
+
+    if downloaded == 0:
+        raise RuntimeError(
+            f"figshare API listed {len(files_meta)} files but none matched required names: "
+            f"{[f.get('name') for f in files_meta]}"
+        )
 
 
 def _download_edinburgh(name, info, dest_dir, session):
@@ -224,7 +266,7 @@ def _manual_fallback(name, info, reason):
 # Verification
 # ---------------------------------------------------------------------------
 
-def _verify(name, dataset_dir):
+def _verify(name, dataset_dir, time_limit_hours=None):
     missing = REQUIRED_FILES - {f.name for f in dataset_dir.iterdir()}
     if missing:
         print(f"  ⚠  {name}: missing files: {', '.join(sorted(missing))}")
@@ -232,17 +274,32 @@ def _verify(name, dataset_dir):
 
     meta_path = dataset_dir / "metadata"
     try:
-        meta = json.loads(meta_path.read_text())
+        # read_bytes + decode strips UTF-8 BOM if present and avoids platform
+        # newline translation that can shift character offsets in error messages.
+        raw = meta_path.read_bytes().decode("utf-8-sig").strip()
+        meta = json.loads(raw)
         needed = {"num_classes", "input_shape", "codename"}
         if not needed.issubset(meta.keys()):
             print(f"  ⚠  {name}: metadata missing keys: {needed - meta.keys()}")
             return False
+
     except Exception as e:
         print(f"  ⚠  {name}: metadata unreadable: {e}")
         return False
 
+    # Always write time_limit into the metadata JSON so the competition runner picks it up.
+    # Re-serialise through json.dumps to normalise encoding, strip BOM, and
+    # guarantee a clean round-trip for every downstream json.load() call.
+    if time_limit_hours is not None:
+        meta['time_limit'] = time_limit_hours
+    elif 'time_limit' not in meta:
+        meta['time_limit'] = 0.5
+    meta_path.write_text(json.dumps(meta, indent=2), encoding='utf-8')
+
+    tl = meta['time_limit']
     print(f"  ✓  {name}: OK  (codename={meta['codename']!r}"
-          f"  classes={meta['num_classes']}  shape={meta['input_shape']})")
+          f"  classes={meta['num_classes']}  shape={meta['input_shape']}"
+          f"  time_limit={tl}h)")
     return True
 
 
@@ -263,6 +320,11 @@ def main():
                         help="Output directory (default: datasets/).")
     parser.add_argument("--skip-existing", action="store_true", default=True,
                         help="Skip datasets that already look complete.")
+    parser.add_argument("--time-limit", type=float, default=None, metavar="HOURS",
+                        help="Write this time_limit into each dataset's metadata JSON. "
+                             "Default: keep existing value or set 0.5h if absent.")
+    parser.add_argument("--patch-time-limit", action="store_true",
+                        help="Only patch time_limit in existing datasets (no download).")
     args = parser.parse_args()
 
     if args.list:
@@ -281,6 +343,19 @@ def main():
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    tl = args.time_limit  # may be None → _verify keeps existing or sets 0.5h
+
+    # ── patch-only mode: just rewrite time_limit in existing metadata ──────────
+    if args.patch_time_limit:
+        print(f"Patching time_limit={tl if tl is not None else '(keep/default 0.5h)'} in existing datasets\n")
+        for name in targets:
+            dest = out_root / name
+            if not dest.exists() or not (dest / "metadata").exists():
+                print(f"  ⚠  {name}: not found at {dest}")
+                continue
+            _verify(name, dest, time_limit_hours=tl)
+        return
+
     session, backend = _make_session()
     print(f"HTTP backend: {backend}")
     print(f"Output dir:   {out_root.resolve()}\n")
@@ -295,8 +370,8 @@ def main():
         if args.skip_existing:
             existing = {f.name for f in dest.iterdir()} if dest.exists() else set()
             if REQUIRED_FILES.issubset(existing):
-                print(f"[{name}] already present — skipping. (delete folder to re-download)")
-                results[name] = True
+                print(f"[{name}] already present — patching time_limit and skipping re-download.")
+                results[name] = _verify(name, dest, time_limit_hours=tl)
                 continue
 
         print(f"\n[{name}]  ({info['host'].upper()}  DOI: {info['doi']})")
@@ -304,11 +379,11 @@ def main():
         try:
             if info["host"] == "ncl":
                 _download_ncl(name, info, dest, session)
-                ok = _verify(name, dest)
+                ok = _verify(name, dest, time_limit_hours=tl)
             else:
                 ok = _download_edinburgh(name, info, dest, session)
                 if ok:
-                    ok = _verify(name, dest)
+                    ok = _verify(name, dest, time_limit_hours=tl)
         except Exception as e:
             _manual_fallback(name, info, str(e))
             ok = False

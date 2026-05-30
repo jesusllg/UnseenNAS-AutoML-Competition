@@ -83,8 +83,13 @@ class DataProcessor:
 
         kw = dict(num_workers=2, pin_memory=torch.cuda.is_available())
 
+        # Seeded generator so shuffle order is reproducible across runs
+        g = torch.Generator()
+        g.manual_seed(42)
+
         train_loader = torch.utils.data.DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, drop_last=True, **kw)
+            train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+            generator=g, **kw)
         valid_loader = torch.utils.data.DataLoader(
             valid_ds, batch_size=batch_size, shuffle=False, **kw)
         test_loader  = torch.utils.data.DataLoader(
