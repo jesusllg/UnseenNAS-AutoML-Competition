@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 import numpy as np
+import torch
 
 from .genotype import Genotype, sample_random_genotype, mutate
 from .family import FamilyProfile
@@ -78,6 +79,9 @@ def aging_evolution(
         try:
             g = repair(g, C, H, W, num_classes, family)
             model = build_model(g, C, H, W, num_classes, aniso_axis=family.aniso_axis)
+            # dry-run: catch any remaining shape errors before proxy eval
+            with torch.no_grad():
+                model.cpu()(torch.zeros(2, C, H, W))
             fit   = proxy_fn(model, batch_x, device)
         except Exception as e:
             logger.debug("Init arch failed: %s", e)
@@ -120,6 +124,9 @@ def aging_evolution(
                 child_g = repair(child_g, C, H, W, num_classes, family)
                 model   = build_model(child_g, C, H, W, num_classes,
                                       aniso_axis=family.aniso_axis)
+                # dry-run: catch any remaining shape errors before proxy eval
+                with torch.no_grad():
+                    model.cpu()(torch.zeros(2, C, H, W))
                 fit     = proxy_fn(model, batch_x, device)
                 break
             except Exception as e:

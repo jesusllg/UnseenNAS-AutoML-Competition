@@ -334,11 +334,17 @@ class LightAttentionBlock(nn.Module):
         self.proj_out = nn.Conv2d(embed_dim, c_out, 1, bias=False)
         self.norm_out = make_norm(c_out, norm_type)
         self.act      = make_act(act_type)
-        self.se       = SEBlock(c_out, se_ratio) if se else nn.Identity()
-        self.dp       = DropPath(drop_path)
-        self.pool     = nn.AvgPool2d(stride, stride) if stride > 1 else nn.Identity()
-        self.skip     = nn.Conv2d(c_in, c_out, 1, stride=stride, bias=False) \
-                        if (c_in != c_out or stride != 1) else nn.Identity()
+        self.se   = SEBlock(c_out, se_ratio) if se else nn.Identity()
+        self.dp   = DropPath(drop_path)
+        # Use AvgPool for BOTH main and skip so spatial size is always floor(H/stride).
+        # Conv2d(stride=2) gives ceil on odd dims; AvgPool2d gives floor — mismatch!
+        _pool = nn.AvgPool2d(stride, stride) if stride > 1 else nn.Identity()
+        self.pool = _pool
+        if c_in != c_out or stride != 1:
+            _skip_pool = nn.AvgPool2d(stride, stride) if stride > 1 else nn.Identity()
+            self.skip = nn.Sequential(_skip_pool, nn.Conv2d(c_in, c_out, 1, bias=False))
+        else:
+            self.skip = nn.Identity()
 
     def forward(self, x):
         B, C, H, W = x.shape
