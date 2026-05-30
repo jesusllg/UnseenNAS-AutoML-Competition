@@ -200,7 +200,7 @@ class Trainer:
             epoch_times.append(time.perf_counter() - t0)
 
             train_acc = accuracy_score(labels, preds)
-            val_acc   = self._evaluate()
+            val_acc   = self._evaluate(self.valid_dl)
             lr_now    = scheduler.get_last_lr()[0]
 
             print("  Epoch {:>3} | Train {:>6.2f}% | Val {:>6.2f}% | {} | lr {:.2e}".format(
@@ -220,26 +220,34 @@ class Trainer:
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
-            print(f"  Restored best weights (val={best_acc:.3f})")
+
+        # Final evaluation with best weights
+        final_val_acc   = self._evaluate(self.valid_dl)
+        final_train_acc = self._evaluate(self.train_dl)
+        print(f"  {'─'*55}")
+        print(f"  Final | Train {final_train_acc*100:.2f}% | Val {final_val_acc*100:.2f}%"
+              f"  (best val seen: {best_acc*100:.2f}%)")
+        print(f"  {'─'*55}")
 
         train_elapsed = time.perf_counter() - t_train_start
-        self._save_report(epoch, best_acc, train_elapsed)
+        self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
+        self._save_model()
 
         return self.model
 
     # ------------------------------------------------------------------
-    def _evaluate(self):
+    def _evaluate(self, loader):
         self.model.eval()
         labels, preds = [], []
         with torch.no_grad():
-            for x, y in self.valid_dl:
+            for x, y in loader:
                 out = self.model(x.to(self.device))
                 labels += y.tolist()
                 preds  += out.argmax(1).cpu().tolist()
         return accuracy_score(labels, preds)
 
     # ------------------------------------------------------------------
-    def _save_report(self, n_epochs, best_val_acc, train_s):
+    def _save_report(self, n_epochs, final_train_acc, final_val_acc, train_s):
         """Write per-dataset JSON + append row to cumulative CSV."""
         codename   = self.metadata.get('codename', 'unknown')
         nas_report = self.metadata.get('nas_report', {})
@@ -252,7 +260,8 @@ class Trainer:
             'best_stages':      nas_report.get('best_stages', '?'),
             'search_s':         nas_report.get('search_s', '?'),
             'n_epochs':         n_epochs,
-            'best_val_acc':     round(best_val_acc, 4),
+            'final_train_acc':  round(final_train_acc, 4),
+            'final_val_acc':    round(final_val_acc, 4),
             'train_s':          round(train_s, 1),
             'num_classes':      self.metadata.get('num_classes', '?'),
             'input_shape':      str(self.metadata.get('input_shape', '?')),
@@ -275,6 +284,17 @@ class Trainer:
             writer.writerow(record)
 
         print(f"  Report saved → {pred_dir / f'{codename}_report.json'}")
+
+    # ------------------------------------------------------------------
+    def _save_model(self):
+        """Save trained model weights to predictions/<codename>_model.pt."""
+        codename = self.metadata.get('codename', 'unknown')
+        pred_dir = Path('predictions')
+        pred_dir.mkdir(exist_ok=True)
+        path = pred_dir / f'{codename}_model.pt'
+        torch.save(self.model.cpu().state_dict(), path)
+        size_mb = path.stat().st_size / (1024 ** 2)
+        print(f"  Model saved  → {path}  ({size_mb:.1f} MB)")
 
     # ------------------------------------------------------------------
     def predict(self, test_loader):

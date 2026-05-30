@@ -313,9 +313,9 @@ def main():
             budget.record_usage(runtime)
 
     # ── Summary table ──────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"{'DATASET':<20} {'STATUS':<10} {'PARAMS':>10} {'RUNTIME':>10} {'VAL':>8}")
-    print(f"{'-'*60}")
+    print(f"\n{'='*72}")
+    print(f"{'DATASET':<20} {'STATUS':<10} {'PARAMS':>10} {'RUNTIME':>10} {'TRAIN':>8} {'VAL':>8}")
+    print(f"{'-'*72}")
     for ds_name, ok in results.items():
         codename = load_metadata(datasets_dir / ds_name).get("codename", ds_name)
         stats_path = pred_dir / f"{codename}_stats.pkl"
@@ -327,16 +327,21 @@ def main():
             params = runtime = "N/A"
 
         report_path = pred_dir / f"{codename}_report.json"
-        val = "N/A"
+        train_str = val_str = "N/A"
         if report_path.exists():
             r = json.loads(report_path.read_text())
-            val = f"{float(r.get('best_val_acc', 0))*100:.2f}%"
+            if 'final_train_acc' in r:
+                train_str = f"{float(r['final_train_acc'])*100:.2f}%"
+            if 'final_val_acc' in r:
+                val_str = f"{float(r['final_val_acc'])*100:.2f}%"
+            elif 'best_val_acc' in r:  # backwards compat
+                val_str = f"{float(r['best_val_acc'])*100:.2f}%"
 
         status = "✓ OK" if ok else "✗ FAIL"
-        print(f"{ds_name:<20} {status:<10} {params:>10} {runtime:>10} {val:>8}")
+        print(f"{ds_name:<20} {status:<10} {params:>10} {runtime:>10} {train_str:>8} {val_str:>8}")
 
     n_ok = sum(results.values())
-    print(f"{'='*60}")
+    print(f"{'='*72}")
     print(f"Completed: {n_ok}/{len(results)} datasets")
 
 
