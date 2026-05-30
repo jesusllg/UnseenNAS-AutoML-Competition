@@ -265,7 +265,7 @@ def main():
                     help="Floor for delta after decay. (default: 0.001 = 0.1pp)")
     ap.add_argument("--es-delta-decay",       type=int,   default=5,
                     help="Improvements before halving delta. (default: 5)")
-    ap.add_argument("--es-regression-delta", type=float, default=0.010,
+    ap.add_argument("--es-regression-delta", type=float, default=0.005,
                     help="Fall >X below best to count as bad epoch. (default: 0.010 = 1pp)")
     args = ap.parse_args()
 
