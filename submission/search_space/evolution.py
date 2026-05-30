@@ -63,11 +63,12 @@ def aging_evolution(
     n_init_attempts = 0
     while len(population) < n_population:
         if time_budget_s and (time.time() - start_time) > time_budget_s * 0.5:
-            logger.warning("Time budget reached during population init; stopping early.")
+            print(f"  [NAS] Init time budget reached ({len(population)}/{n_population} seeded).")
             break
         n_init_attempts += 1
-        if n_init_attempts > n_population * 10:
-            logger.warning("Too many repair failures during init; stopping early.")
+        if n_init_attempts > n_population * 30:  # generous: 30× pop size
+            print(f"  [NAS] Init attempts={n_init_attempts}, seeded={len(population)}/{n_population}."
+                  f" Continuing with partial population.")
             break
 
         g = sample_random_genotype(

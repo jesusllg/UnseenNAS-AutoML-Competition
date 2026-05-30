@@ -120,16 +120,28 @@ def trainability(model: nn.Module, batch_x: torch.Tensor,
             scores.append(-np.inf)
             continue
 
-        # handle spatial mismatch with pixel unshuffle
+        # align spatial dims — PixelUnshuffle requires integer, divisible stride
         if g_out.size(2) != g_in.size(2) or g_out.size(3) != g_in.size(3):
             bo, co, ho, wo = g_out.size()
             bi, ci, hi, wi = g_in.size()
-            stride = max(1, int(hi / max(ho, 1)))
-            if stride > 1:
-                g_in = nn.PixelUnshuffle(stride)(g_in)
+            if ho == 0 or wo == 0 or hi % ho != 0 or wi % wo != 0:
+                continue  # non-divisible (e.g. 9→4): skip this pair
+            sh, sw = hi // ho, wi // wo
+            if sh != sw or sh < 1:
+                continue  # non-uniform stride: skip
+            if sh > 1:
+                try:
+                    g_in = nn.PixelUnshuffle(sh)(g_in)
+                except Exception:
+                    continue
+            bi, ci, hi, wi = g_in.size()
 
         bo, co, ho, wo = g_out.size()
         bi, ci, hi, wi = g_in.size()
+
+        # flattened spatial must match for the Jacobian mm
+        if bo * ho * wo != bi * hi * wi:
+            continue
 
         g_out_flat = g_out.permute(0, 2, 3, 1).contiguous().view(bo * ho * wo, co)
         g_in_flat  = g_in.permute(0, 2, 3, 1).contiguous().view(bi * hi * wi, ci)
@@ -181,16 +193,24 @@ def az_nas_score(
     if isinstance(device, str):
         device = torch.device(device)
 
-    e = expressivity(model, batch_x, device)
-    p = progressivity(model, batch_x, device)
-    t = trainability(model, batch_x, device)
-    c = complexity_penalty(model)
-
-    for v, name in [(e, 'E'), (p, 'P'), (t, 'T')]:
-        if not np.isfinite(v):
+    def _safe(fn):
+        try:
+            return fn(model, batch_x, device)
+        except Exception:
             return -np.inf
 
-    return e + p + t - lambda_c * c
+    e = _safe(expressivity)
+    p = _safe(progressivity)
+    t = _safe(trainability)
+    c = complexity_penalty(model)
+
+    # Use whichever proxies are finite — if all fail, return -inf.
+    # Gracefully handles datasets with odd spatial dims (e.g. Sudoku 9×9)
+    # where some proxies consistently fail.
+    parts = [v for v in (e, p, t) if np.isfinite(v)]
+    if not parts:
+        return -np.inf
+    return sum(parts) - lambda_c * c
 
 
 def az_nas_score_full(
