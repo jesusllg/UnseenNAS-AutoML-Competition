@@ -1,6 +1,5 @@
 import csv
 import json
-import random
 import time
 import traceback
 from datetime import datetime
@@ -12,9 +11,7 @@ import torch.nn as nn
 from torch import optim
 from sklearn.metrics import accuracy_score
 
-from helpers import show_time
-
-SEED = 42
+from helpers import show_time, set_seeds, GLOBAL_SEED
 
 # train_frac is a fraction of the TOTAL clock budget (not of remaining time).
 # search_frac + train_frac should sum to ≤ 0.95, leaving ~5% for predict/overhead.
@@ -29,15 +26,6 @@ _ES_MIN_EPOCHS   = 10     # warmup: ES cannot trigger before this epoch
 _ES_DELTA_START  = 0.005  # initial min-improvement threshold (0.5 pp)
 _ES_DELTA_MIN    = 5e-5   # floor for delta after decay (~0.005 pp)
 _ES_DELTA_DECAY  = 5      # consecutive improvements before halving delta
-
-
-def _set_seeds():
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 class _EarlyStopper:
@@ -114,7 +102,7 @@ class Trainer:
             return self.model
 
     def _train(self):
-        _set_seeds()
+        set_seeds(self.metadata.get('seed', GLOBAL_SEED))
         self.model.to(self.device)
 
         # Complementary fractions of the TOTAL clock budget:

@@ -51,12 +51,21 @@ def aging_evolution(
     n_rounds:        int  = 200,
     tournament_size: int  = 10,
     time_budget_s:   Optional[float] = None,
+    seed:            int  = 42,
     verbose:         bool = False,
 ) -> List[Individual]:
     """
     Runs Aging Evolution and returns the full population sorted by fitness.
     Stops early if time_budget_s is reached.
     """
+    # Seed all randomness so the search is fully reproducible
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
     population: List[Individual] = []
     start_time = time.time()
 

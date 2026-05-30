@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from helpers import show_time
+from helpers import show_time, set_seeds, GLOBAL_SEED
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,9 @@ class NAS:
             return SearchableCNN(in_c, n_cls, _FALLBACK['medium'], hw)
 
     def _search(self):
+        seed = self.metadata.get('seed', GLOBAL_SEED)
+        set_seeds(seed)
+
         shape = self.metadata['input_shape']
         in_c  = shape[1]
         H, W  = shape[2], shape[3]
@@ -176,6 +179,7 @@ class NAS:
                 n_rounds        = n_rounds,
                 tournament_size = tourney_k,
                 time_budget_s   = search_budget,
+                seed            = seed,
                 verbose         = True,
             )
         except Exception as e:

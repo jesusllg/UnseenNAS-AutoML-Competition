@@ -128,6 +128,7 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
     imut     = copy.deepcopy(clock)
 
     # Inject all tunable pipeline params so NAS/Trainer read them from metadata
+    meta['seed']             = args.seed
     meta['search_frac']      = args.search_frac
     meta['n_population']     = args.nas_population
     meta['n_rounds']         = args.nas_rounds
@@ -150,7 +151,7 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
           f" | search={args.search_frac} train={args.train_frac} wd={args.weight_decay:.0e}"
           f" | NAS pop={args.nas_population} rounds={args.nas_rounds} k={args.nas_tournament}"
           f" | ES={es_str}")
-    _injected = {'search_frac','n_population','n_rounds','tournament_size',
+    _injected = {'seed','search_frac','n_population','n_rounds','tournament_size',
                  'proxy_epochs','proxy_batches','train_frac','weight_decay',
                  'es_enabled','es_patience','es_min_epochs',
                  'es_delta_start','es_delta_min','es_delta_decay'}
@@ -214,6 +215,8 @@ def main():
                          "Mutually exclusive with --time.")
     ap.add_argument("--min-time", type=float, default=0.1, metavar="HOURS",
                     help="Floor time per dataset when using --total-time. (default: 0.1h)")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Global random seed for NAS search and training. (default: 42)")
     ap.add_argument("--truncate", action="store_true",
                     help="Use only 64 samples per split (quick smoke-test).")
     ap.add_argument("--datasets-dir", default="datasets", metavar="DIR",
