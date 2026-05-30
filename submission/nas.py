@@ -86,8 +86,8 @@ _FALLBACK = {
 # ── Search helpers ────────────────────────────────────────────────────────────
 
 _N_POPULATION    = 100
-_N_ROUNDS        = 1000   # effectively "run until time budget expires"
-_TOURNAMENT_SIZE = 10
+_N_ROUNDS        = 2000   # effectively "run until time budget expires"
+_TOURNAMENT_SIZE = 25
 _SEARCH_FRAC     = 0.30
 
 

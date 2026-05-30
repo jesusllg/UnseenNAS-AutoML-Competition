@@ -243,10 +243,10 @@ def main():
                     help="Fraction of total budget for final training. (default: 0.65)")
     ap.add_argument("--nas-population",   type=int,   default=100,
                     help="NAS population size. (default: 100)")
-    ap.add_argument("--nas-rounds",       type=int,   default=1000,
-                    help="Max NAS evolution rounds (stops at time budget). (default: 1000)")
-    ap.add_argument("--nas-tournament",   type=int,   default=10,
-                    help="NAS tournament size. (default: 10)")
+    ap.add_argument("--nas-rounds",       type=int,   default=2000,
+                    help="Max NAS evolution rounds (stops at time budget). (default: 2000)")
+    ap.add_argument("--nas-tournament",   type=int,   default=25,
+                    help="NAS tournament size. (default: 25)")
     ap.add_argument("--proxy-epochs",     type=int,   default=3,
                     help="Training epochs per candidate during proxy eval. (default: 3)")
     ap.add_argument("--proxy-batches",    type=int,   default=40,
