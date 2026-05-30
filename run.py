@@ -242,8 +242,8 @@ def main():
     # ── Early stopping (dynamic delta) ───────────────────────────────────────
     ap.add_argument("--no-es", dest="es_enabled", action="store_false", default=True,
                     help="Disable early stopping entirely.")
-    ap.add_argument("--es-patience",     type=int,   default=40,
-                    help="Consecutive non-improving epochs before stopping. (default: 40)")
+    ap.add_argument("--es-patience",     type=int,   default=20,
+                    help="Consecutive non-improving epochs before stopping. (default: 20)")
     ap.add_argument("--es-min-epochs",   type=int,   default=10,
                     help="Minimum epochs before ES can trigger. (default: 10)")
     ap.add_argument("--es-delta-start",  type=float, default=0.005,

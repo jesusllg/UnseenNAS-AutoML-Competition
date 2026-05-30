@@ -21,7 +21,7 @@ _WEIGHT_DECAY = 1e-4
 
 # Early stopping defaults
 _ES_ENABLED      = True
-_ES_PATIENCE     = 40     # consecutive non-improving epochs before stopping
+_ES_PATIENCE     = 20     # consecutive non-improving epochs before stopping
 _ES_MIN_EPOCHS   = 10     # warmup: ES cannot trigger before this epoch
 _ES_DELTA_START  = 0.005  # initial min-improvement threshold (0.5 pp)
 _ES_DELTA_MIN    = 0.001  # floor for delta (0.1 pp) — keeps threshold achievable
