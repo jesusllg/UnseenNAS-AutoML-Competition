@@ -22,8 +22,8 @@ _FAMILY_COST_WEIGHT = {
     'visual_medium':       1.00,
     'channel_heavy':       1.20,
     'possible_voxel':      1.30,
-    'anisotropic':         1.00,
-    'spatiotemporal_like': 1.50,
+    'anisotropic':         1.80,
+    'spatiotemporal_like': 1.80,
     'visual_large':        2.00,
 }
 
