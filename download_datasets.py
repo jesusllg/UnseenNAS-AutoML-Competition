@@ -24,6 +24,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import time
 import zipfile
@@ -266,6 +267,21 @@ def _manual_fallback(name, info, reason):
 # Verification
 # ---------------------------------------------------------------------------
 
+def _sanitize_metadata_json(raw: str) -> str:
+    """
+    Fix known invalid JSON patterns that appear in some competition metadata files.
+
+    Observed case: Edinburgh DataShare datasets (Cryptic, Windspeed) ship with
+    bare unquoted ? as a value, e.g. "benchmark": ?  — valid Python/YAML but
+    invalid JSON. json.loads raises JSONDecodeError: Expecting value.
+
+    We replace every occurrence of  : <optional-whitespace> ?
+    followed by , } or end-of-line with : null so the file round-trips cleanly.
+    """
+    # bare ? value:  "key": ?  ->  "key": null
+    return re.sub(r':\s*\?(\s*[,}\]\n\r])', r': null\1', raw)
+
+
 def _verify(name, dataset_dir, time_limit_hours=None):
     missing = REQUIRED_FILES - {f.name for f in dataset_dir.iterdir()}
     if missing:
@@ -274,9 +290,10 @@ def _verify(name, dataset_dir, time_limit_hours=None):
 
     meta_path = dataset_dir / "metadata"
     try:
-        # read_bytes + decode strips UTF-8 BOM if present and avoids platform
-        # newline translation that can shift character offsets in error messages.
+        # read_bytes + decode strips UTF-8 BOM if present; sanitize fixes
+        # known invalid JSON patterns (e.g. bare ? values in Edinburgh datasets).
         raw = meta_path.read_bytes().decode("utf-8-sig").strip()
+        raw = _sanitize_metadata_json(raw)
         meta = json.loads(raw)
         needed = {"num_classes", "input_shape", "codename"}
         if not needed.issubset(meta.keys()):

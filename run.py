@@ -26,6 +26,7 @@ import math
 import numpy as np
 import os
 import pickle as pkl
+import re
 import sys
 import time
 import traceback
@@ -93,9 +94,14 @@ class GlobalTimeBudget:
                   f"  ~{show_time(carry)}/dataset remaining")
 
 
+def _sanitize_metadata_json(raw: str) -> str:
+    """Replace bare unquoted ? values (e.g. "benchmark": ?) with null."""
+    return re.sub(r':\s*\?(\s*[,}\]\n\r])', r': null\1', raw)
+
+
 def load_metadata(dataset_path: Path) -> dict:
     raw = (dataset_path / "metadata").read_bytes().decode("utf-8-sig").strip()
-    return json.loads(raw)
+    return json.loads(_sanitize_metadata_json(raw))
 
 
 def load_dataset(dataset_path: Path, truncate: bool):
