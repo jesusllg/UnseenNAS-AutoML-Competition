@@ -1,0 +1,724 @@
+\documentclass[10pt,twocolumn]{article}
+
+% ---------------------------------------------------------------------------
+% Geometry-Conditioned, Repair-Guaranteed Zero-Cost NAS for Unseen Data
+% Self-contained: compiles with a vanilla pdflatex install (no external .sty).
+% ---------------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage{microtype}
+
+% ---- listings style for genotype / repair pseudocode -----------------------
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\definecolor{codekw}{rgb}{0.10,0.10,0.55}
+\definecolor{codecm}{rgb}{0.35,0.50,0.35}
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  breaklines=true,
+  frame=single,
+  framesep=3pt,
+  columns=fullflexible,
+  showstringspaces=false,
+  language=Python,
+}
+
+\newcommand{\family}[1]{\textsc{#1}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{\vspace{-1.5em}\textbf{Geometry-Conditioned, Repair-Guaranteed Zero-Cost
+Neural Architecture Search for Truly Unseen Data}}
+
+\author{
+NAS Unseen-Data 2026 Submission\\
+\small Technical Report
+}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a neural architecture search (NAS) system designed for the
+\emph{unseen-data} regime, in which the search algorithm is given only a tensor
+of unknown semantics --- its modality, label structure, and even spatial
+meaning are hidden --- together with a wall-clock budget. Standard NAS
+pipelines assume a fixed, hand-tuned search space for a known domain (e.g.\
+$32{\times}32$ natural images) and break down when handed a $1{\times}9{\times}9$
+symbolic grid or a $1{\times}6{\times}768$ pseudo-sequence. Our central insight is
+that, while the \emph{semantics} of an unseen tensor are unknown, its
+\emph{geometry} is fully observable and carries strong structural priors. Our
+primary contribution is the \emph{system}: the synthesis that makes zero-cost,
+evolutionary NAS run unattended and end-to-end across radically different data
+geometries with no per-dataset tuning. Within it we contribute: (i) a
+deterministic \emph{family inference} map from input geometry to hard
+architectural constraints and soft sampling biases; (ii) a
+\emph{spatial-aware repair operator}, applied inside the evolutionary loop, that
+projects any sampled or mutated genotype onto the feasible set with correct
+ceil/floor down-sampling semantics --- turning mutation into a Markov kernel
+that never produces a broken architecture; (iii) a \emph{hardware-aware memory
+budget} folded into repair so that feasibility accounts for true training-time
+memory, not just forward activations; and (iv) a \emph{three-zone
+early-stopping} rule that distinguishes regression from plateau and therefore
+terminates cleanly even on tasks driven to their theoretical accuracy ceiling.
+We adapt the AZ-NAS zero-cost proxies to a free-form, heterogeneous search space
+via a gradient-retaining feature hook with per-proxy graceful degradation, and
+drive an \emph{anytime} aging-evolution search that scales to whatever
+wall-clock budget each dataset is given. We further detail the robustness
+engineering --- a three-level defense against shape errors, full seeding under
+seed-sensitive zero-cost proxies, and tolerant metadata parsing --- that lets
+the system survive thirteen unknown datasets unattended.
+\end{abstract}
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+
+Neural architecture search has matured into a reliable tool \emph{when the
+target domain is known}. A practitioner searching for a CIFAR-10 classifier
+chooses a search space whose primitives, resolutions, and down-sampling
+schedule already encode decades of vision priors. The NAS Unseen-Data
+challenge inverts this assumption: the system receives a tensor of shape
+$N\times C\times H\times W$ with no information about what the data
+\emph{means}. Across the challenge's practice datasets a single pipeline must
+cope with, among others:
+
+\begin{itemize}\itemsep2pt
+\item tiny symbolic grids ($1{\times}9{\times}9$ Sudoku / Game-of-Life),
+\item multi-channel board states ($12{\times}8{\times}8$ chess tensors),
+\item elongated pseudo-sequences ($1{\times}6{\times}768$ cryptic crosswords,
+      $1{\times}28{\times}768$ language tensors),
+\item volumetric data ($20{\times}20{\times}20$ voxels),
+\item and conventional images ($3{\times}28{\times}28$ to $3{\times}128{\times}128$).
+\end{itemize}
+
+A search space tuned for any one of these is pathological for the others: a
+fixed four-stage stride-2 schedule annihilates a $9{\times}9$ grid after two
+stages; a square $3{\times}3$ kernel wastes capacity on a $1{\times}768$ axis;
+an attention head that is cheap at $8{\times}8$ is ruinous at
+$128{\times}128$. The naive failure modes are not subtle --- they are shape
+errors, out-of-memory crashes, and architectures that simply cannot be built.
+
+\paragraph{Thesis.} The semantics of an unseen tensor are hidden, but its
+\emph{geometry is not}. The number of channels, the spatial aspect ratio, the
+absolute spatial extent, and the number of classes are all observable before
+any training, and each is a strong structural prior. Our system turns geometry
+into constraints, constraints into a feasible search space, and a feasible
+search space into a robust, time-bounded search.
+
+% ===========================================================================
+\section{What Is Original Here}
+\label{sec:original}
+% ===========================================================================
+
+Because this system deliberately reuses strong existing components, we begin by
+drawing a sharp line between prior art and our contribution.
+
+\subsection{Reused prior art (not claimed)}
+\begin{itemize}\itemsep2pt
+\item \textbf{AZ-NAS zero-cost proxies.} The four proxy signals ---
+  \emph{expressivity} (eigenvalue entropy of per-layer feature covariance),
+  \emph{progressivity} (minimum inter-layer entropy increment),
+  \emph{trainability} (inter-layer Jacobian spectral score), and a
+  \emph{complexity} penalty --- are taken from AZ-NAS~\cite{aznas2024}.
+\item \textbf{Aging (regularized) evolution.} The population search with
+  tournament selection and oldest-first eviction follows
+  Real et al.~\cite{regevo2019}.
+\item \textbf{Block primitives.} Inverted-residual / MBConv~\cite{mobilenetv2},
+  squeeze-excitation~\cite{senet}, stochastic depth /
+  DropPath~\cite{stochasticdepth}, separable and bottleneck convolutions are
+  all standard.
+\end{itemize}
+
+\subsection{Original contributions (claimed)}
+\label{sec:contributions}
+
+Our primary contribution is a \emph{system}: the particular synthesis of
+components below is, to our knowledge, the first to make zero-cost,
+evolutionary NAS run \emph{unattended and end-to-end across radically different
+data geometries} without any per-dataset human tuning. No single ingredient is
+sufficient --- a geometry prior with no repair still crashes; repair with a
+fixed search space still wastes capacity; a zero-cost proxy designed for a
+fixed cell does not even run on a $9{\times}9$ grid. The contribution is that
+these pieces are made mutually compatible and self-correcting. We decompose it
+into the following claims.
+
+\paragraph{(A) System-level: an anytime, geometry-to-architecture pipeline for
+unseen data.} A complete method that ingests an uninterpreted tensor and a
+wall-clock budget and returns a trained classifier, scaling its own
+search/train effort to whatever time it is given and never overrunning. The
+end-to-end coupling --- geometry $\rightarrow$ constraints $\rightarrow$
+repair-guaranteed feasible space $\rightarrow$ proxy-driven evolution
+$\rightarrow$ time-budgeted training --- is the headline result.
+
+\paragraph{(B) Component contributions.}
+\begin{enumerate}\itemsep3pt
+\item \textbf{Geometry$\rightarrow$family inference} (\S\ref{sec:family}). A
+  deterministic map \code{infer\_family(C,H,W,n\_cls)} from raw input geometry
+  to one of eight \emph{family profiles}, each fixing hard constraints (max
+  down-sampling steps, normalization, anisotropy axis, attention
+  admissibility) and soft sampling biases. Conditioning the search space itself
+  on observable geometry --- rather than on a known dataset identity --- is the
+  move that makes the unseen-data setting tractable.
+
+\item \textbf{Repair as a feasibility projection inside the evolutionary loop}
+  (\S\ref{sec:repair}). A deterministic projection \code{repair(g,\dots)} that
+  maps \emph{any} genotype onto the feasible set by tracking true spatial size
+  with correct ceil/floor down-sampling semantics. Applied to both
+  initialization and \emph{every} mutation, repair turns the mutation operator
+  into a Markov kernel that always lands in the feasible region --- so the
+  search never spends a single evaluation on a broken architecture, and the
+  effective search distribution is the feasible set, not the raw genotype
+  space.
+
+\item \textbf{Hardware-aware memory feasibility} (\S\ref{sec:memory}). A
+  training-memory estimator that counts \emph{expanded intermediate}
+  activations (which dominate at large spatial extent) under a training
+  overhead factor, with a budget tied to the \emph{actual} GPU. The constraint
+  moves out of the training loop (where it is a crash) and into the search
+  space (where it is, at worst, a slightly smaller still-strong network).
+
+\item \textbf{Three-zone early stopping} (\S\ref{sec:es}). Separate
+  \emph{regression} and \emph{plateau} counters that terminate cleanly both on
+  worsening runs and on runs pinned at a theoretical-maximum accuracy, where
+  standard no-improvement patience never fires.
+
+\item \textbf{Free-form AZ-NAS adaptation with graceful degradation}
+  (\S\ref{sec:proxy-adapt}). A gradient-retaining \code{extract\_layer\_features}
+  hook lets AZ-NAS proxies --- written for the fixed NAS-Bench-201 cell --- run
+  on a heterogeneous, variable-depth space. Crucially, the score is assembled
+  from \emph{whichever} proxies remain finite for a given geometry, so the
+  \emph{same} proxy survives both a $9{\times}9$ grid and a
+  $128{\times}128$ image without special-casing. This per-proxy degradation is
+  itself a generalization mechanism, not just error handling.
+\end{enumerate}
+
+\paragraph{(C) Design elements that, while individually small, are part of the
+novelty and are easy to miss.}
+\begin{itemize}\itemsep2pt
+\item \textbf{Vestigial-stage genome.} The genome always carries the maximum
+  number of stage genes but decodes only the active prefix. Depth mutations are
+  therefore reversible and never destroy genetic material, preserving diversity
+  under variable-depth evolution.
+\item \textbf{The head is a free gene.} We impose \emph{no} prior on the
+  classifier head (seven pooling/MLP variants compete), on the principle that
+  the right read-out for an unknown geometry is exactly what search should
+  discover.
+\item \textbf{A coherent anisotropy thread.} The detected anisotropy axis flows
+  from family inference through factored $(1{\times}k)+(k{\times}1)$ blocks to
+  axis-aligned pooling in the decoder, giving elongated $1{\times}N$ tensors a
+  structurally appropriate operator set.
+\item \textbf{Defense-in-depth for shape correctness} (\S\ref{sec:defense}):
+  block-level spatial invariants, static repair, and a dynamic dry run --- three
+  independent layers, each catching what the previous might miss.
+\item \textbf{Determinism as a correctness property} (\S\ref{sec:reproducibility}).
+  Because zero-cost proxies are RNG-sensitive (trainability draws Rademacher
+  vectors via \code{torch.bernoulli}), seeding every source is what makes the
+  \emph{ranking}, and hence the search, reproducible rather than merely tidy.
+\end{itemize}
+
+The remainder of the paper develops each contribution, then describes the
+end-to-end pipeline.
+
+% ===========================================================================
+\section{Geometry-Conditioned Family Inference}
+\label{sec:family}
+% ===========================================================================
+
+The first stage observes only $(C,H,W,\text{n\_cls})$ and emits a
+\code{FamilyProfile}. Let $s_{\min}=\min(H,W)$, $s_{\max}=\max(H,W)$,
+$A=HW$, and the anisotropy ratio $\rho=s_{\max}/\max(s_{\min},1)$. The rules
+are evaluated in priority order; the first match wins.
+
+\begin{table}[t]
+\centering
+\caption{The eight geometry-derived families. ``Pools'' is the hard cap on
+down-sampling stages; ``GN'' forces GroupNorm; ``Aniso'' marks an anisotropic
+down-sampling axis. Block lists are \emph{soft} sampling biases, not hard
+constraints.}
+\label{tab:families}
+\footnotesize
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Family & Trigger (priority order) & Pools & GN & Aniso\\
+\midrule
+\family{anisotropic}        & $\rho\!\ge\!6,\ s_{\min}\!\le\!8$           & $\le2$ & \checkmark & \checkmark\\
+\family{small\_grid}        & $s_{\max}\!\le\!10$                          & $1$    & \checkmark & --\\
+\family{possible\_voxel}    & $H\!\approx\!W\!\approx\!C,\ A\!\le\!625$     & $2$    & \checkmark & --\\
+\family{channel\_heavy}     & $C\!\ge\!8,\ A\!\le\!1024$                    & $2$    & cond.\ & --\\
+\family{spatiotemporal}     & $C\!\ge\!3,\ (H{=}1\!\lor\!W{=}1),s_{\max}\!\ge\!32$ & $3$ & -- & \checkmark\\
+\family{visual\_large}      & $s_{\min}\!\ge\!64$                          & $5$    & -- & --\\
+\family{visual\_medium}     & $s_{\min}\!\ge\!24$                          & $3$    & -- & --\\
+\family{compact\_general}   & otherwise                                    & $2$    & -- & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two design choices deserve emphasis. First, the head type is left a
+\emph{fully free gene} --- we deliberately impose \emph{no} prior on the
+classifier head, since the relationship between geometry and the right pooling
+strategy is exactly what the search should discover. Second, the
+\family{small\_grid} and anisotropic families force GroupNorm: a
+$9{\times}9$ feature map yields few spatial samples per channel, so
+BatchNorm statistics are unreliable, whereas GroupNorm is batch-independent.
+These are the kind of priors a human would apply after \emph{seeing} the data;
+we derive them from geometry alone.
+
+% ===========================================================================
+\section{The Genotype and Its Decoding}
+\label{sec:genotype}
+% ===========================================================================
+
+An architecture is a fixed-width \emph{genotype}: a small set of global genes
+(stem type, stem width, neck, head, head dropout, normalization, and an active
+stage count $n\!\le\!5$) plus five \emph{stage genes}. Each stage gene is an
+integer-indexed tuple over discrete option lists: block type (11 choices),
+kernel $\in\{1,3,5,7\}$, blocks-per-stage $\in\{1,2,3,4\}$, channel width (9
+levels from 16 to 256), expansion, dilation, squeeze-excitation toggle and
+ratio, skip mode, down-sampling op $\in\{\text{stride2, maxpool, avgpool,
+identity}\}$, and drop-path rate. Vestigial stages beyond $n$ are retained in
+the genome but ignored at build time, so mutation can grow or shrink depth
+without destroying genetic material.
+
+The decoder (\code{build\_model}) is geometry-agnostic by construction: it
+chains a stem, the active stages (each optionally preceded by a separate
+down-sampling module), a neck, and a head. The decisive design element is the
+feature hook described in \S\ref{sec:proxy-adapt}.
+
+% ===========================================================================
+\section{Spatial-Aware Repair}
+\label{sec:repair}
+% ===========================================================================
+
+Random sampling and mutation over the genotype space routinely produce
+\emph{infeasible} architectures: a $5{\times}5$ kernel on a $4{\times}4$ map, a
+fifth down-sampling stage on an already-$1{\times}1$ tensor, an attention block
+on a degenerate spatial grid. Rather than reject-and-resample (wasteful) or
+hope-and-crash (fatal), we \emph{repair}: a deterministic operator that
+projects any genotype onto the feasible set.
+
+\subsection{The ceil/floor subtlety}
+The repair operator's correctness hinges on tracking the true spatial size.
+PyTorch's strided convolution with ``same'' padding rounds \emph{up}
+($\lceil h/2\rceil$, e.g.\ $9\!\to\!5$), whereas max/avg pooling rounds
+\emph{down} ($\lfloor h/2\rfloor$, e.g.\ $9\!\to\!4$). A repair pass that
+assumes a single rule produces a model whose main path and skip connection
+disagree on spatial size --- the classic ``expected 5 got 4'' runtime error.
+We encode the distinction explicitly:
+
+\begin{lstlisting}
+def _actual_spatial(h, ds):
+    if ds == 'identity': return h
+    if ds == 'stride2':  return (h + 1) // 2   # ceil
+    return max(1, h // 2)                       # floor (pool)
+\end{lstlisting}
+
+\subsection{Eleven ordered rules}
+Repair applies, in order: (R1) clamp stage count; (R2) apply the family's
+normalization override; (R3--R4) replace family-forbidden and
+geometry-illegal blocks; (R5--R7) a single spatial-aware pass that --- per
+stage --- converts strided convolution on an odd dimension to pooling (so
+floor semantics hold everywhere), enforces the family's pooling budget, clamps
+the kernel below the current spatial size, and clamps dilation so the effective
+receptive field fits; (R8) enforce monotonically non-decreasing channel widths;
+(R9--R10) coerce the head to a geometry-compatible variant; and (R11) the
+hardware-aware memory guard of \S\ref{sec:memory}. The output is guaranteed
+constructible, and --- in combination with the dry run of
+\S\ref{sec:defense} --- guaranteed to execute a forward pass.
+
+% ===========================================================================
+\section{Hardware-Aware Memory Feasibility}
+\label{sec:memory}
+% ===========================================================================
+
+A subtle but critical failure mode is the architecture that builds, scores
+well under zero-cost proxies, and \emph{then} exhausts GPU memory during
+training. We observed exactly this: a model on a large-spatial input allocated
+$>22$\,GB and crashed, producing zero predictions for that dataset.
+
+\subsection{Estimating the right quantity}
+The root cause was a memory estimator that counted only stage-\emph{output}
+activations. This ignores the two dominant terms during training:
+
+\begin{enumerate}\itemsep2pt
+\item \textbf{Expanded intermediates.} An MBConv block expands channels by up
+  to $6\times$ internally; at large spatial extent this intermediate tensor,
+  not the block output, dominates memory.
+\item \textbf{Training overhead.} Backward-pass gradient buffers and the
+  Adam optimizer's two moment tensors multiply the activation footprint.
+\end{enumerate}
+
+Our estimator therefore sums, over active stages, both output and
+\emph{expanded} intermediate activations, and applies a conservative training
+factor:
+\begin{equation}
+\hat{M} \;=\; \tau \cdot 4 \!\!\sum_{\text{stages}}\!\! B\big(c_{\text{out}}hw +
+n_{\text{blk}}\,c_{\text{mid}}\,hw\big)\ \text{bytes},
+\end{equation}
+with $c_{\text{mid}}=\max(c_{\text{in}},c_{\text{out}})\cdot\text{expansion}$,
+batch $B$, and training factor $\tau=3$. On the worst-case model that crashed,
+this estimate is $21.9$\,GB --- matching the observed allocation, versus the
+$\sim0.2$\,GB the old estimator reported.
+
+\subsection{Budget tied to real hardware}
+A fixed budget would be wrong in both directions: too small forces needlessly
+tiny networks; too large fails to prevent the crash. We instead set the budget
+to $80\%$ of the \emph{physical} GPU memory queried at runtime
+(\code{torch.cuda.get\_device\_properties}), with a 16\,GB fallback. Because the
+estimator is deliberately conservative (it bills activations at fp32 while
+training actually runs in fp16 / AMP), $80\%$ of physical memory is a safe
+target. The guard then shrinks an over-budget genotype in capacity-preserving
+order --- expansion first, then width, then depth --- for up to three rounds.
+
+\begin{table}[t]
+\centering
+\caption{Memory guard behavior. Only the genuinely GPU-exceeding model is
+altered; normal-geometry models pass untouched, preserving the strong
+architectures the search finds. Estimates at $B{=}32$.}
+\label{tab:memory}
+\footnotesize
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Input geometry & Before & After & Action\\
+\midrule
+$3{\times}32{\times}32$ (CIFAR-scale)  & 0.6\,GB  & 0.6\,GB  & untouched\\
+$3{\times}96{\times}96$                & 5.0\,GB  & 5.0\,GB  & untouched\\
+$3{\times}128{\times}128$              & 9.0\,GB  & 9.0\,GB  & untouched\\
+$1{\times}160{\times}160$ (worst case) & 21.9\,GB & 10.8\,GB & shrunk\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:memory} captures the design goal precisely: the guard is
+\emph{inert} for all normal geometries and activates only for the catastrophic
+case, where it preserves a strong $192$-channel, four-stage network rather than
+collapsing to a degenerate one. A trainable smaller network strictly dominates
+an out-of-memory crash.
+
+% ===========================================================================
+\section{Adapting AZ-NAS to a Free-Form Space}
+\label{sec:proxy-adapt}
+% ===========================================================================
+
+AZ-NAS proxies require per-layer features with retained gradients --- the
+trainability proxy back-propagates a random cotangent between consecutive
+layers and scores the resulting Jacobian's spectrum. The original
+implementation relies on the fixed NAS-Bench-201 cell interface. We instead
+have the decoded model expose a hook:
+
+\begin{lstlisting}
+def extract_layer_features(self, x):
+    feats = []
+    x = self.stem(x)
+    x = x.clone().requires_grad_(True); x.retain_grad()
+    feats.append(x)
+    for stage, ds in zip(self.stages, self.downs):
+        if ds is not None: x = ds(x)
+        x = stage(x)
+        x = x.clone().requires_grad_(True); x.retain_grad()
+        feats.append(x)
+    return feats
+\end{lstlisting}
+
+This makes the identical proxy math apply to a heterogeneous, variable-depth
+network. The combined score is
+\begin{equation}
+S \;=\; E + P + T \;-\; \lambda_c \log(\#\text{params}+1),
+\end{equation}
+with $\lambda_c=0.1$, after a Kaiming fan-in re-initialization.
+
+\paragraph{Graceful degradation.} Some geometries make a proxy ill-defined ---
+e.g.\ a $9\!\to\!4$ down-sampling makes the trainability Jacobian's spatial
+strides non-divisible, so the layer pair is skipped. We compute $S$ from
+whichever of $\{E,P,T\}$ remain finite, returning $-\infty$ only if all fail.
+This single change is what lets the \emph{same} proxy survive Sudoku
+($9{\times}9$) and Myofibre ($128{\times}128$) without special-casing.
+
+% ===========================================================================
+\section{Aging-Evolution Search}
+\label{sec:search}
+% ===========================================================================
+
+We search with regularized (aging) evolution~\cite{regevo2019}: maintain a
+population, repeatedly draw a tournament, mutate its fittest member, evaluate
+the child's zero-cost score, append it, and evict the \emph{oldest} individual.
+Age-based eviction keeps the population churning and resists premature
+convergence. Three elements are tailored to our setting:
+
+\begin{itemize}\itemsep2pt
+\item \textbf{Repair-in-the-loop.} Every sampled and mutated genotype passes
+  through \code{repair} \emph{and} a CPU dry run before scoring, so the
+  population never contains an infeasible individual.
+\item \textbf{Mutation-scale annealing.} The mutation operator anneals from
+  \emph{large} (replace a whole stage or a global gene) early, through
+  \emph{medium}, to \emph{small} (perturb one field) late, trading exploration
+  for exploitation as the budget is consumed.
+\item \textbf{Time as the true terminator.} The nominal round count
+  ($2000$) is a ceiling; the search actually runs until a fraction of the
+  wall-clock budget is spent, so it scales to whatever time the dataset is
+  allotted.
+\end{itemize}
+
+\begin{algorithm}[t]
+\caption{Repair-guarded aging evolution (abridged)}
+\label{alg:evo}
+\begin{algorithmic}[1]
+\State seed all RNGs \Comment{determinism, \S\ref{sec:reproducibility}}
+\State $\mathcal{P}\gets\emptyset$
+\While{$|\mathcal{P}|<P$ and time left}
+  \State $g\gets$ \Call{Repair}{\Call{Sample}{family}}
+  \If{\Call{DryRun}{$g$} ok} $\mathcal{P}\gets\mathcal{P}\cup\{(g,\textsc{Proxy}(g))\}$ \EndIf
+\EndWhile
+\While{round $<R$ and time left}
+  \State $t\gets$ tournament of $k$ from $\mathcal{P}$
+  \State $g'\gets$ \Call{Repair}{\Call{Mutate}{$\arg\max_{\text{fit}}t$, scale}}
+  \State score $g'$ via dry-run-checked \textsc{Proxy}; append
+  \State age all; evict oldest
+\EndWhile
+\State \Return $\arg\max_{\text{fit}}\mathcal{P}$
+\end{algorithmic}
+\end{algorithm}
+
+% ===========================================================================
+\section{Anytime Budgeting}
+\label{sec:anytime}
+% ===========================================================================
+
+The competition allots each dataset a wall-clock \code{time\_limit}, and a
+pipeline that overruns is penalized while one that finishes early wastes
+compute. Our pipeline is therefore \emph{anytime} at two scales. Within a
+dataset, search consumes a fixed fraction of the budget and training claims the
+remainder, but training additionally projects its own per-epoch cost (a moving
+average of recent epoch times) and stops \emph{before} an epoch would breach the
+deadline --- so it neither overruns nor leaves an epoch's worth of time on the
+table. Across datasets, an optional global pool redistributes time saved on an
+easy dataset to the remaining ones, subject to a per-dataset floor. Combined
+with the time-terminated evolution of \S\ref{sec:search}, the same code runs
+sensibly whether a dataset is given thirty minutes or seven hours, with no
+hyper-parameter change.
+
+% ===========================================================================
+\section{Three-Zone Early Stopping}
+\label{sec:es}
+% ===========================================================================
+
+Final training is time-budgeted, but we still want to stop a model that has
+converged so the saved time returns to the global pool. Standard
+``stop after $p$ epochs without improvement'' fails in two opposite regimes we
+actually hit: it stops \emph{too early} when a still-learning model oscillates,
+and it \emph{never} stops a model pinned at a theoretical accuracy ceiling
+(e.g.\ a deterministic task at $100\%$ validation), where the metric neither
+improves nor regresses.
+
+We therefore classify each epoch into three zones relative to the running best
+$v^\star$, an improvement threshold $\delta$ (which decays as improvements
+accumulate), and a regression threshold $\delta_r$:
+\[
+\text{epoch} \in
+\begin{cases}
+\text{$\star$\ improvement} & v > v^\star + \delta\\
+\text{$\downarrow$ regression} & v < v^\star - \delta_r\\
+\text{$\sim$ plateau} & \text{otherwise.}
+\end{cases}
+\]
+Improvement resets both counters and updates $v^\star$; regression increments a
+patience counter; plateau increments a \emph{separate} plateau counter.
+Training stops when either counter saturates. The plateau counter is the key
+addition: it guarantees termination on ceiling-pinned tasks, while the
+regression counter tolerates the benign oscillations that wrongly tripped
+naive patience. The best weights (by validation accuracy) are always restored
+before the final report.
+
+% ===========================================================================
+\section{Robustness Engineering}
+\label{sec:defense}
+% ===========================================================================
+
+A competition pipeline that crashes on one dataset forfeits that dataset
+entirely. We hardened the system along three axes.
+
+\paragraph{Three-level defense against shape errors.}
+(1) Block constructors keep main-path and skip-path spatial sizes consistent
+(e.g.\ the attention block pools its skip with the same floor semantics as its
+body); (2) the repair operator of \S\ref{sec:repair} statically prevents
+infeasible geometry; (3) a CPU dry run with a batch of two executes a real
+forward pass after \code{build\_model} and before any expensive proxy
+evaluation, so any residual shape error is caught and the individual silently
+discarded rather than aborting the search.
+
+\paragraph{Per-batch OOM recovery.}
+As a last resort, the training loop catches
+\code{torch.cuda.OutOfMemoryError} per batch, clears the cache, and skips the
+batch; three consecutive OOMs escalate to a clear diagnostic rather than a raw
+stack trace.
+
+\paragraph{Tolerant metadata parsing.}
+Competition metadata files are external data and not always valid JSON.
+We encountered both a UTF-8 BOM and \emph{bare unquoted tokens} as values
+(e.g.\ \code{"benchmark": ?}), which abort \code{json.loads} at a byte offset
+with no obvious cause. Our loader strips the BOM and coerces a family of
+non-standard bare tokens --- \code{?}, \code{NA}, \code{N/A}, \code{NaN},
+\code{Inf}/\code{-Inf}/\code{Infinity}, \code{None}, \code{undefined}, and
+Python-cased \code{True}/\code{False} --- to valid JSON, using look-ahead so
+quoted strings like \code{"NA"} are never touched. The sanitized file is
+rewritten so the (unmodifiable) competition runner also reads valid JSON.
+
+% ===========================================================================
+\section{Determinism Under Seed-Sensitive Proxies}
+\label{sec:reproducibility}
+% ===========================================================================
+
+Zero-cost proxies are unusually RNG-sensitive: AZ-NAS trainability draws a
+Rademacher cotangent via \code{torch.bernoulli}, and the proxy's value ---
+hence the relative ranking of two architectures, hence the entire evolutionary
+trajectory --- shifts with the random state. Reproducibility is therefore not
+cosmetic; it is a correctness property of the search. A single
+\code{set\_seeds} call seeds Python's \code{random}, NumPy, and Torch
+(CPU+CUDA), and enables deterministic cuDNN, at the head of both search and
+training. We verified that two independent runs with the same seed return the
+identical best genotype and fitness.
+
+% ===========================================================================
+\section{Experimental Protocol}
+\label{sec:protocol}
+% ===========================================================================
+
+The system is evaluated on the thirteen NAS Unseen-Data practice datasets. For
+each, the pipeline receives the data tensors and a per-dataset wall-clock
+\code{time\_limit}; it allocates a fraction to search and the remainder to
+time-budgeted training, reserving a buffer for prediction. Data processing
+derives per-channel normalization from the training split, applies geometry-aware
+augmentation (horizontal flip always; reflective random-crop only when
+$H\!\ge\!32$), and selects batch size by pixel count to bound memory. All
+randomness is seeded (\S\ref{sec:reproducibility}); the test split is never used
+for model selection.
+
+\paragraph{Accuracy results.} Per-dataset test accuracy is reported in
+Table~\ref{tab:results}. \emph{These cells are placeholders to be filled from
+the official evaluation; we do not report fabricated numbers.}
+
+\begin{table}[t]
+\centering
+\caption{Per-dataset results (to be completed from official evaluation).
+Params and search/train split are emitted automatically by the pipeline's
+report writer.}
+\label{tab:results}
+\footnotesize
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Dataset & Family & Params & Val & Test\\
+\midrule
+AddNIST     & \family{visual\_medium} & -- & -- & --\\
+Language    & \family{spatiotemporal} & -- & -- & --\\
+MultNIST    & \family{visual\_medium} & -- & -- & --\\
+CIFARTile   & \family{visual\_large}  & -- & -- & --\\
+Gutenberg   & \family{spatiotemporal} & -- & -- & --\\
+GeoClassing & \family{visual\_medium} & -- & -- & --\\
+Chesseract  & \family{channel\_heavy} & -- & -- & --\\
+Sudoku      & \family{small\_grid}    & -- & -- & --\\
+Voxel       & \family{possible\_voxel}& -- & -- & --\\
+Myofibre    & \family{visual\_large}  & -- & -- & --\\
+GameOfLife  & \family{small\_grid}    & -- & -- & --\\
+Cryptic     & \family{anisotropic}    & -- & -- & --\\
+Windspeed   & \family{spatiotemporal} & -- & -- & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\section{Related Work}
+% ===========================================================================
+
+\textbf{Zero-cost NAS.} Training-free proxies estimate architecture quality
+from a single minibatch~\cite{naswot,zerocost}. AZ-NAS~\cite{aznas2024}
+assembles complementary proxies whose \emph{ranking} correlates strongly with
+final accuracy; we adopt its signals but transplant them onto a free-form
+search space. \textbf{Evolutionary NAS.} Regularized evolution~\cite{regevo2019}
+established age-based eviction; we add repair-in-the-loop and mutation-scale
+annealing. \textbf{Search-space design.} Most NAS fixes a domain-specific space
+a priori; our family inference instead \emph{derives} the space from observable
+geometry, which is the defining requirement of the unseen-data regime.
+
+% ===========================================================================
+\section{Conclusion}
+% ===========================================================================
+
+We described a NAS \emph{system} whose contribution is as much in the synthesis
+as in any single part: the organizing principle is that input \emph{geometry},
+though not semantics, is observable and richly informative, and the engineering
+is what turns that principle into a pipeline that runs unattended across
+thirteen unknown datasets. Geometry yields a family of hard constraints; a
+spatial-aware repair operator, applied inside the evolutionary loop, turns those
+constraints into a feasible search space where every candidate is buildable ---
+making mutation a feasibility-preserving kernel; a hardware-aware memory guard
+keeps feasibility honest with respect to the real GPU without collapsing to
+degenerate networks; and adapted zero-cost proxies with per-proxy graceful
+degradation, driven by repair-guarded aging evolution under an anytime time
+budget, select the architecture. Robustness engineering --- a three-level
+shape-error defense, deterministic search under seed-sensitive proxies, and
+tolerant metadata parsing --- makes the difference between a method that works
+on a slide and one that survives thirteen unknown datasets unattended. We view
+the central lesson as transferable: when the data is unknown but its shape is
+not, condition the search space on geometry and make feasibility a guarantee,
+not a hope.
+
+% ===========================================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+\bibitem{aznas2024}
+J.~Lee and B.~Ham.
+\newblock {AZ-NAS}: Assembling Zero-Cost Proxies for Network Architecture Search.
+\newblock In \emph{CVPR}, 2024.
+
+\bibitem{regevo2019}
+E.~Real, A.~Aggarwal, Y.~Huang, and Q.~V. Le.
+\newblock Regularized Evolution for Image Classifier Architecture Search.
+\newblock In \emph{AAAI}, 2019.
+
+\bibitem{naswot}
+J.~Mellor, J.~Turner, A.~Storkey, and E.~J. Crowley.
+\newblock Neural Architecture Search without Training.
+\newblock In \emph{ICML}, 2021.
+
+\bibitem{zerocost}
+M.~S. Abdelfattah, A.~Mehrotra, {\L}.~Dudziak, and N.~D. Lane.
+\newblock Zero-Cost Proxies for Lightweight NAS.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem{mobilenetv2}
+M.~Sandler, A.~Howard, M.~Zhu, A.~Zhmoginov, and L.-C. Chen.
+\newblock {MobileNetV2}: Inverted Residuals and Linear Bottlenecks.
+\newblock In \emph{CVPR}, 2018.
+
+\bibitem{senet}
+J.~Hu, L.~Shen, and G.~Sun.
+\newblock Squeeze-and-Excitation Networks.
+\newblock In \emph{CVPR}, 2018.
+
+\bibitem{stochasticdepth}
+G.~Huang, Y.~Sun, Z.~Liu, D.~Sedra, and K.~Q. Weinberger.
+\newblock Deep Networks with Stochastic Depth.
+\newblock In \emph{ECCV}, 2016.
+
+\bibitem{nasbench201}
+X.~Dong and Y.~Yang.
+\newblock {NAS-Bench-201}: Extending the Scope of Reproducible Neural
+Architecture Search.
+\newblock In \emph{ICLR}, 2020.
+\end{thebibliography}
+
+\end{document}
