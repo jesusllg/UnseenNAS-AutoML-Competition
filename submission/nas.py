@@ -7,7 +7,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from helpers import show_time, set_seeds, GLOBAL_SEED
+from pathlib import Path
+
+from helpers import (show_time, set_seeds, GLOBAL_SEED,
+                     GlobalBudgetGovernor,
+                     N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +116,21 @@ class NAS:
         self.clock = clock
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        # ── Global Budget Governor ────────────────────────────────────────────
+        self._wall_start = time.perf_counter()
+        gbg = GlobalBudgetGovernor(
+            n_total     = metadata.get('n_competition_datasets', N_COMPETITION_DATASETS),
+            total_hours = metadata.get('total_competition_hours', TOTAL_COMPETITION_HOURS),
+        )
+        self._effective_budget_s = gbg.get_allocation(
+            metadata, datasets_dir=Path('datasets')
+        )
+        # Inject into in-memory metadata dict so Trainer can read it (no disk writes)
+        metadata['effective_budget_s']  = self._effective_budget_s
+        metadata['_gbg']                = gbg
+        metadata['_pipeline_wall_start'] = self._wall_start
+        gbg.record_start(metadata.get('codename', 'unknown'))
+
     def search(self):
         try:
             return self._search()
@@ -136,7 +155,8 @@ class NAS:
         n_rounds  = self.metadata.get('n_rounds',        _N_ROUNDS)
         tourney_k = self.metadata.get('tournament_size', _TOURNAMENT_SIZE)
         search_frac   = self.metadata.get('search_frac', _SEARCH_FRAC)
-        search_budget = self.clock.check() * search_frac
+        # Cap search to our effective per-dataset budget, not just clock remaining
+        search_budget = min(self.clock.check(), self._effective_budget_s) * search_frac
         t_search_start = time.perf_counter()
         print(f"  NAS | sf={search_frac:.2f} → budget={show_time(search_budget)}"
               f"  pop={n_pop} rounds={n_rounds} | device={self.device}")

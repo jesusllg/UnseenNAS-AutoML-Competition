@@ -124,6 +124,10 @@ class Trainer:
         # remaining ≈ (1 - search_frac) * total  →  train_budget = train_frac * total
         remaining_frac = max(1.0 - search_frac, 1e-6)
         train_budget   = self.clock.check() * (train_frac / remaining_frac)
+        # Cap to our GBG-allocated share so we don't over-run the global pool
+        eff_s = self.metadata.get('effective_budget_s')
+        if eff_s is not None:
+            train_budget = min(train_budget, eff_s * train_frac)
         deadline       = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 
@@ -252,6 +256,12 @@ class Trainer:
         train_elapsed = time.perf_counter() - t_train_start
         self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
         self._save_model()
+
+        # Notify GBG that this dataset's full pipeline is done
+        gbg = self.metadata.get('_gbg')
+        if gbg is not None:
+            wall_start = self.metadata.get('_pipeline_wall_start', time.perf_counter())
+            gbg.record_done(seconds_actual=time.perf_counter() - wall_start)
 
         return self.model
 
