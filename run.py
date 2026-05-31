@@ -95,8 +95,23 @@ class GlobalTimeBudget:
 
 
 def _sanitize_metadata_json(raw: str) -> str:
-    """Replace bare unquoted ? values (e.g. "benchmark": ?) with null."""
-    return re.sub(r':\s*\?(\s*[,}\]\n\r])', r': null\1', raw)
+    """
+    Coerce non-standard bare values in metadata JSON to valid JSON equivalents.
+    Handles: ? NA N/A NaN nan Inf -Inf Infinity None undefined True False.
+    Quoted string values like "benchmark": "NA" are left untouched.
+    """
+    _NULL_TOKENS = (
+        r'\?'
+        r'|N/A|NA'
+        r'|NaN|nan'
+        r'|[+-]?[Ii]nfinity|[+-]?[Ii]nf'
+        r'|None'
+        r'|undefined'
+    )
+    raw = re.sub(r':\s*(?:' + _NULL_TOKENS + r')(?=\s*[,}\]\r\n])', ': null', raw)
+    raw = re.sub(r':\s*True(?=\s*[,}\]\r\n])',  ': true',  raw)
+    raw = re.sub(r':\s*False(?=\s*[,}\]\r\n])', ': false', raw)
+    return raw
 
 
 def load_metadata(dataset_path: Path) -> dict:

@@ -269,17 +269,47 @@ def _manual_fallback(name, info, reason):
 
 def _sanitize_metadata_json(raw: str) -> str:
     """
-    Fix known invalid JSON patterns that appear in some competition metadata files.
+    Coerce non-standard bare values in metadata JSON to valid JSON equivalents.
 
-    Observed case: Edinburgh DataShare datasets (Cryptic, Windspeed) ship with
-    bare unquoted ? as a value, e.g. "benchmark": ?  — valid Python/YAML but
-    invalid JSON. json.loads raises JSONDecodeError: Expecting value.
+    Competition datasets (especially Edinburgh DataShare) sometimes ship
+    metadata files with values that are legal in Python, R, YAML, or
+    JavaScript but not in strict JSON.  All of the following are replaced
+    with JSON null (or the correct JSON boolean) so json.loads never fails.
 
-    We replace every occurrence of  : <optional-whitespace> ?
-    followed by , } or end-of-line with : null so the file round-trips cleanly.
+    Null-like  →  null
+        ?           (missing, common in spreadsheet exports)
+        NA / N/A    (R / pandas missing)
+        NaN / nan   (IEEE 754 — not in JSON spec)
+        Inf / -Inf / Infinity / -Infinity / inf / -inf   (IEEE 754)
+        None        (Python)
+        undefined   (JavaScript)
+
+    Boolean  →  true / false
+        True / False  (Python capitalised booleans)
+
+    Quoted string values like "benchmark": "NA" are left completely untouched
+    because the patterns only match *unquoted* bare tokens that appear between
+    the colon and the next structural character (, } ] or newline).
     """
-    # bare ? value:  "key": ?  ->  "key": null
-    return re.sub(r':\s*\?(\s*[,}\]\n\r])', r': null\1', raw)
+    # Build the pattern for null-like bare tokens (lookahead preserves the
+    # trailing structural character so we don't have to re-insert it).
+    _NULL_TOKENS = (
+        r'\?'                           # ?
+        r'|N/A|NA'                      # R / spreadsheet
+        r'|NaN|nan'                     # IEEE NaN
+        r'|[+-]?[Ii]nfinity|[+-]?[Ii]nf'  # IEEE Inf variants
+        r'|None'                        # Python
+        r'|undefined'                   # JavaScript
+    )
+    raw = re.sub(
+        r':\s*(?:' + _NULL_TOKENS + r')(?=\s*[,}\]\r\n])',
+        ': null',
+        raw,
+    )
+    # Python capitalised booleans
+    raw = re.sub(r':\s*True(?=\s*[,}\]\r\n])',  ': true',  raw)
+    raw = re.sub(r':\s*False(?=\s*[,}\]\r\n])', ': false', raw)
+    return raw
 
 
 def _verify(name, dataset_dir, time_limit_hours=None):
