@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent / "submission"))
 from nas import NAS
 from data_processor import DataProcessor
 from trainer import Trainer
+from helpers import estimate_dataset_cost
 
 
 # ── helpers (mirrors evaluation/main.py) ─────────────────────────────────────
@@ -344,10 +345,26 @@ def main():
     # ── Time budget setup ─────────────────────────────────────────────────────
     budget = None
     if args.total_time is not None:
+        # Load metadata and compute geometry-based cost proxy for each dataset
+        costs = {}
+        meta_cache = {}
+        for p in targets:
+            try:
+                m = load_metadata(p)
+                meta_cache[p.name] = m
+                costs[p.name] = estimate_dataset_cost(m)
+            except Exception:
+                costs[p.name] = 1.0
+
+        # Sort cheapest→most-expensive so surplus time flows to harder datasets
+        targets = sorted(targets, key=lambda p: costs[p.name])
+
         budget = GlobalTimeBudget(args.total_time, n_ds, args.min_time)
         per = args.total_time / n_ds
         print(f"Global budget: {args.total_time}h / {n_ds} datasets"
-              f" = ~{per:.2f}h each (floor {args.min_time}h)")
+              f" = ~{per:.2f}h initial each (floor {args.min_time}h) — sorted by cost:")
+        for p in targets:
+            print(f"  {p.name}: cost={costs[p.name]:.2f}")
 
     results = {}
     for ds_path in targets:
