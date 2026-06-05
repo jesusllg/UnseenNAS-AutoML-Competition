@@ -104,7 +104,21 @@ def aging_evolution(
         logger.error("Could not initialise any valid architecture.")
         return population
 
+    # Pre-age initial population so FIFO eviction is correct from round 1.
+    # init[0] (first inserted) gets the highest starting age → evicted first.
+    # Without this, all initial members start at age=0, the new child also
+    # starts at age=0, aging everyone by +1 gives all age=1, and stable-sort
+    # puts the child last → pop(-1) removes the child instead of init[0].
+    n_init = len(population)
+    for i, ind in enumerate(population):
+        ind.age = n_init - 1 - i  # init[0] → age n-1 (oldest), init[n-1] → age 0
+
     best_fitness = max(ind.fitness for ind in population)
+    # Track global best separately — aging eviction removes the OLDEST, not the worst,
+    # so the best individual can get expelled from the population and be lost.
+    # This is a running max equivalent to argmax(all history), matching Real et al.
+    _gb = max(population, key=lambda x: x.fitness)
+    global_best: Individual = Individual(_gb.genotype, _gb.fitness)
 
     # ── Evolution rounds ──────────────────────────────────────────────────────
     for rnd in range(n_rounds):
@@ -153,10 +167,22 @@ def aging_evolution(
 
         if fit > best_fitness:
             best_fitness = fit
+            # Snapshot BEFORE this individual ages out of the population.
+            # child_g comes from mutate() so it's a fresh object not shared with population.
+            global_best = Individual(child_g, fit)
             if verbose:
                 print(f"  [round {rnd+1}/{n_rounds}] new best fitness={fit:.4f}  scale={scale}")
 
     population.sort(key=lambda x: x.fitness, reverse=True)
+
+    # Reinsert global_best if aging evicted it (replace worst current member)
+    if not population or global_best.fitness > population[0].fitness:
+        if population and global_best.fitness > population[-1].fitness:
+            population[-1] = global_best
+            population.sort(key=lambda x: x.fitness, reverse=True)
+        elif not population:
+            population.append(global_best)
+
     return population
 
 

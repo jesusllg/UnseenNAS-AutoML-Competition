@@ -258,8 +258,8 @@ Family & Trigger (priority order) & Pools & GN & Aniso\\
 \midrule
 \family{anisotropic}        & $\rho\!\ge\!6,\ s_{\min}\!\le\!8$           & $\le2$ & \checkmark & \checkmark\\
 \family{small\_grid}        & $s_{\max}\!\le\!10$                          & $1$    & \checkmark & --\\
-\family{possible\_voxel}    & $H\!\approx\!W\!\approx\!C,\ A\!\le\!625$     & $2$    & \checkmark & --\\
-\family{channel\_heavy}     & $C\!\ge\!8,\ A\!\le\!1024$                    & $2$    & cond.\ & --\\
+\family{possible\_voxel}    & $H\!\approx\!W\!\approx\!C,\ C\!\ge\!8,\ A\!\le\!625$ & $2$ & \checkmark & --\\
+\family{channel\_heavy}     & $C\!\ge\!8,\ A\!\le\!1024$                    & $2$    & $8\mid C$ & --\\
 \family{spatiotemporal}     & $C\!\ge\!3,\ (H{=}1\!\lor\!W{=}1),s_{\max}\!\ge\!32$ & $3$ & -- & \checkmark\\
 \family{visual\_large}      & $s_{\min}\!\ge\!64$                          & $5$    & -- & --\\
 \family{visual\_medium}     & $s_{\min}\!\ge\!24$                          & $3$    & -- & --\\
@@ -483,13 +483,16 @@ convergence. Three elements are tailored to our setting:
   \State $g\gets$ \Call{Repair}{\Call{Sample}{family}}
   \If{\Call{DryRun}{$g$} ok} $\mathcal{P}\gets\mathcal{P}\cup\{(g,\textsc{Proxy}(g))\}$ \EndIf
 \EndWhile
+\State assign ages $P{-}1,P{-}2,\ldots,0$ to $\mathcal{P}$ in insertion order \Comment{FIFO initialisation}
+\State $g^*\gets\arg\max_{\text{fit}}\mathcal{P}$ \Comment{global best; tracked across eviction}
 \While{round $<R$ and time left}
   \State $t\gets$ tournament of $k$ from $\mathcal{P}$
   \State $g'\gets$ \Call{Repair}{\Call{Mutate}{$\arg\max_{\text{fit}}t$, scale}}
   \State score $g'$ via dry-run-checked \textsc{Proxy}; append
+  \If{fitness$(g')>$ fitness$(g^*)$} $g^*\gets g'$ \EndIf \Comment{running max over all history}
   \State age all; evict oldest
 \EndWhile
-\State \Return $\arg\max_{\text{fit}}\mathcal{P}$
+\State \Return $g^*$ \Comment{$=\arg\max$ over all history; may differ from $\arg\max_{\text{fit}}\mathcal{P}$}
 \end{algorithmic}
 \end{algorithm}
 
