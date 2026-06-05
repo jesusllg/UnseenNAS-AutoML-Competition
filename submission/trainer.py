@@ -128,18 +128,20 @@ class Trainer:
         train_frac   = self.metadata.get('train_frac',   _TRAIN_FRAC)
         weight_decay = self.metadata.get('weight_decay', _WEIGHT_DECAY)
 
-        # remaining ≈ (1 - search_frac) * total  →  train_budget = train_frac * total
-        remaining_frac = max(1.0 - search_frac, 1e-6)
-        train_budget   = self.clock.check() * (train_frac / remaining_frac)
-        # Cap to whatever is left of the GBG allocation after search already ran.
-        # Using elapsed time (not a fixed fraction) means unused search time flows here.
         eff_s = self.metadata.get('effective_budget_s')
         if eff_s is not None:
+            # GBG is active: training gets everything left of the allocated budget.
+            # elapsed already accounts for DataProcessor + NAS, so no fraction needed.
+            # clock.check() is the hard ceiling (organizer's clock).
             elapsed = time.perf_counter() - self.metadata.get('_pipeline_wall_start',
                                                                time.perf_counter())
             effective_remaining = max(0.0, eff_s - elapsed)
-            train_budget = min(train_budget, effective_remaining)
-        deadline       = time.perf_counter() + train_budget
+            train_budget = min(self.clock.check(), effective_remaining)
+        else:
+            # Legacy fallback when GBG is not available: estimate from fractions.
+            remaining_frac = max(1.0 - search_frac, 1e-6)
+            train_budget   = self.clock.check() * (train_frac / remaining_frac)
+        deadline = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 
         # Early stopping (regression-based with dynamic improvement delta)

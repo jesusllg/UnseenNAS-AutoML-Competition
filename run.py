@@ -377,7 +377,12 @@ def main():
     for ds_path in targets:
         # Determine time allocation for this dataset
         if budget is not None:
-            hours = budget.next_allocation() / 3600
+            # Halving: give pool/2 so the clock is always >= GBG allocation.
+            # Equal-thirds gave 8h while GBG said 11.75h → clock won, GBG was useless.
+            n_rem = budget.n_remaining
+            pool_h = budget.pool / 3600
+            hours = (pool_h / 2) if n_rem > 1 else pool_h
+            hours = max(hours, args.min_time)
         elif args.time is not None:
             hours = args.time
         else:
