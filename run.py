@@ -211,6 +211,13 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
         preds = trainer.predict(test_loader)
         np.save(pred_dir / f"{codename}.npy", preds)
 
+        # Unload model from GPU so the next dataset starts with a clean slate
+        trainer.model.cpu()
+        del trainer, model, trained
+        import gc; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Auto test accuracy if test_y.npy available (local evaluation only)
         test_acc = None
         test_y_path = dataset_path / "test_y.npy"
@@ -352,7 +359,7 @@ def main():
             try:
                 m = load_metadata(p)
                 meta_cache[p.name] = m
-                costs[p.name] = estimate_dataset_cost(m)
+                costs[p.name] = estimate_dataset_cost(m, dataset_dir=p)
             except Exception:
                 costs[p.name] = 1.0
 

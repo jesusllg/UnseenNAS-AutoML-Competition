@@ -109,6 +109,13 @@ class Trainer:
             print("  [Trainer] Unexpected error — returning model as-is.")
             print(traceback.format_exc())
             return self.model
+        finally:
+            # Always notify GBG of completion, even on failure, so state stays consistent
+            gbg = self.metadata.get('_gbg')
+            if gbg is not None and not self.metadata.get('_gbg_done'):
+                self.metadata['_gbg_done'] = True   # guard against double-call
+                wall_start = self.metadata.get('_pipeline_wall_start', time.perf_counter())
+                gbg.record_done(seconds_actual=time.perf_counter() - wall_start)
 
     def _train(self):
         set_seeds(self.metadata.get('seed', GLOBAL_SEED))
@@ -256,12 +263,6 @@ class Trainer:
         train_elapsed = time.perf_counter() - t_train_start
         self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
         self._save_model()
-
-        # Notify GBG that this dataset's full pipeline is done
-        gbg = self.metadata.get('_gbg')
-        if gbg is not None:
-            wall_start = self.metadata.get('_pipeline_wall_start', time.perf_counter())
-            gbg.record_done(seconds_actual=time.perf_counter() - wall_start)
 
         return self.model
 

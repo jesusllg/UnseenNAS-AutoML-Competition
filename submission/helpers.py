@@ -55,18 +55,33 @@ def show_time(seconds):
         return "{}h,{}m,{}s".format(hours, minutes, seconds)
 
 
-def estimate_dataset_cost(meta: dict) -> float:
-    """Estimate relative compute cost from metadata geometry (no data loading)."""
+def estimate_dataset_cost(meta: dict, dataset_dir=None) -> float:
+    """
+    Estimate relative compute cost from metadata.
+
+    Uses actual train_x.npy file size when dataset_dir is provided —
+    much more reliable than shape alone since log() compresses 10 GB vs 600 MB
+    into almost the same value. Falls back to input_shape when file is absent.
+    """
     shape = meta.get('input_shape', [0, 1, 1, 1])
     N, C, H, W = shape[0], shape[1], shape[2], shape[3]
     n_cls = meta.get('num_classes', 10)
+
+    # Volume in elements; prefer actual file size (avoids log-compression of N)
+    volume = max(N * C * H * W, 1)
+    if dataset_dir is not None:
+        npy = Path(dataset_dir) / 'train_x.npy'
+        if npy.exists():
+            volume = max(npy.stat().st_size / 4, 1)  # float32 → element count
+
     try:
         from search_space import infer_family
         fw = _FAMILY_COST_WEIGHT.get(infer_family(C, H, W, n_cls).name, 1.0)
     except Exception:
         fw = 1.0
     class_factor = max(1.0, n_cls / 10.0)
-    return math.log(max(N * C * H * W, 1) + 1) * fw * class_factor
+    # x^0.4 preserves large differences better than log while avoiding pure linearity
+    return (volume ** 0.4) * fw * class_factor
 
 
 def compute_allocations(costs: dict, pool_seconds: float,
@@ -107,7 +122,11 @@ class GlobalBudgetGovernor:
     def _load(self) -> dict:
         try:
             if self._STATE_FILE.exists():
-                return json.loads(self._STATE_FILE.read_text())
+                state = json.loads(self._STATE_FILE.read_text())
+                # Auto-reset when a previous full run completed so the next run starts clean
+                if state.get('n_done', 0) >= self.n_total:
+                    return {'n_done': 0, 'seconds_used': 0.0}
+                return state
         except Exception:
             pass
         return {'n_done': 0, 'seconds_used': 0.0}
@@ -154,9 +173,9 @@ class GlobalBudgetGovernor:
                     r':\s*(?:\?|N/A|NA|NaN|nan|None|undefined)(?=\s*[,}\]\r\n])',
                     ': null', raw)
                 m   = _json.loads(raw)
-                costs[m.get('codename', p.name)] = estimate_dataset_cost(m)
+                costs[m.get('codename', p.name)] = estimate_dataset_cost(m, dataset_dir=p)
             except Exception:
-                costs[p.name] = estimate_dataset_cost(current_meta)
+                costs[p.name] = estimate_dataset_cost(current_meta, dataset_dir=p)
         return costs
 
     def record_start(self, dataset_name: str = ''):

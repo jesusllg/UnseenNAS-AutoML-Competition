@@ -116,6 +116,12 @@ class NAS:
         self.clock = clock
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        # Release any GPU memory the previous dataset may have left behind
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # ── Global Budget Governor ────────────────────────────────────────────
         self._wall_start = time.perf_counter()
         gbg = GlobalBudgetGovernor(
