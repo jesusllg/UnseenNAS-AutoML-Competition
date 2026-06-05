@@ -128,9 +128,7 @@ class NAS:
             n_total     = metadata.get('n_competition_datasets', N_COMPETITION_DATASETS),
             total_hours = metadata.get('total_competition_hours', TOTAL_COMPETITION_HOURS),
         )
-        self._effective_budget_s = gbg.get_allocation(
-            metadata, datasets_dir=Path('datasets')
-        )
+        self._effective_budget_s = gbg.get_allocation(metadata)
         # Inject into in-memory metadata dict so Trainer can read it (no disk writes)
         metadata['effective_budget_s']  = self._effective_budget_s
         metadata['_gbg']                = gbg

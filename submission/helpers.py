@@ -136,41 +136,33 @@ class GlobalBudgetGovernor:
         self._STATE_FILE.write_text(json.dumps(self._state, indent=2))
 
     def get_allocation(self, meta: dict, datasets_dir: Path = None) -> float:
-        """Return effective budget in seconds for the current dataset."""
+        """Return effective budget in seconds for the current dataset.
+
+        Strategy (pure halving — predictable and matches the design spec):
+          - n_remaining == 1 → full remaining pool (last dataset takes everything unused)
+          - otherwise       → pool / 2  (first dataset keeps roughly half; surplus
+                              accumulates for subsequent datasets)
+
+        The `datasets_dir` parameter is accepted for API compatibility but no longer
+        used for proportional allocation (proportional gave datasets with cheap cost
+        estimates too little time, conflicting with the halving design).
+        """
         n_done       = self._state.get('n_done', 0)
         seconds_used = self._state.get('seconds_used', 0.0)
         remaining    = max(0.0, self.pool_s - seconds_used)
         n_remaining  = max(1, self.n_total - n_done)
 
-        # Last dataset gets the entire remaining pool — no ceiling, no proportional split.
-        # Two datasets already ran; everything unused belongs to this one.
+        # Last dataset gets the entire remaining pool — no ceiling.
         if n_remaining == 1:
-            print(f"  [GBG] last dataset → full pool alloc={remaining/3600:.2f}h")
+            print(f"  [GBG] last dataset → full pool alloc={remaining/3600:.2f}h"
+                  f"  (pool={remaining/3600:.2f}h, done={n_done}/{self.n_total})")
             return remaining
 
-        if datasets_dir is not None:
-            costs = self._scan_costs(meta, Path(datasets_dir))
-            # Only use proportional split when we see MORE datasets than already done;
-            # otherwise the scan is counting finished datasets and would under-allocate.
-            if len(costs) > n_remaining:
-                # We can see all datasets but some are done — fall through to equal split
-                pass
-            elif len(costs) > 1:
-                allocs = compute_allocations(costs, remaining)
-                name   = meta.get('codename', '')
-                for k, v in allocs.items():
-                    if k == name or name in k or k in name:
-                        alloc_h = v / 3600
-                        print(f"  [GBG] proportional alloc={alloc_h:.2f}h"
-                              f" ({remaining/3600:.2f}h pool, {len(costs)} datasets visible)")
-                        return float(v)
-
-        # Halving strategy: always take half the remaining pool.
-        # Gives each dataset more runway than equal-thirds while guaranteeing
-        # the last dataset inherits everything unused by the earlier ones.
+        # Halving: take half the remaining pool.
+        # DS1=pool/2, DS2=(pool-used1)/2, DS3=everything left.
         alloc = remaining / 2
         print(f"  [GBG] halving alloc={alloc/3600:.2f}h"
-              f" ({remaining/3600:.2f}h pool ÷ 2, {n_remaining} datasets remaining)")
+              f"  (pool={remaining/3600:.2f}h ÷ 2, done={n_done}/{self.n_total})")
         return alloc
 
     def _scan_costs(self, current_meta: dict, datasets_dir: Path) -> dict:
