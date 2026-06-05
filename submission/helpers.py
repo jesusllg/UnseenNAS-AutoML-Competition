@@ -165,9 +165,12 @@ class GlobalBudgetGovernor:
                               f" ({remaining/3600:.2f}h pool, {len(costs)} datasets visible)")
                         return float(v)
 
-        alloc = remaining / n_remaining
-        print(f"  [GBG] equal-split alloc={alloc/3600:.2f}h"
-              f" ({remaining/3600:.2f}h pool ÷ {n_remaining} remaining)")
+        # Halving strategy: always take half the remaining pool.
+        # Gives each dataset more runway than equal-thirds while guaranteeing
+        # the last dataset inherits everything unused by the earlier ones.
+        alloc = remaining / 2
+        print(f"  [GBG] halving alloc={alloc/3600:.2f}h"
+              f" ({remaining/3600:.2f}h pool ÷ 2, {n_remaining} datasets remaining)")
         return alloc
 
     def _scan_costs(self, current_meta: dict, datasets_dir: Path) -> dict:
