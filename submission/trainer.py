@@ -131,10 +131,14 @@ class Trainer:
         # remaining ≈ (1 - search_frac) * total  →  train_budget = train_frac * total
         remaining_frac = max(1.0 - search_frac, 1e-6)
         train_budget   = self.clock.check() * (train_frac / remaining_frac)
-        # Cap to our GBG-allocated share so we don't over-run the global pool
+        # Cap to whatever is left of the GBG allocation after search already ran.
+        # Using elapsed time (not a fixed fraction) means unused search time flows here.
         eff_s = self.metadata.get('effective_budget_s')
         if eff_s is not None:
-            train_budget = min(train_budget, eff_s * train_frac)
+            elapsed = time.perf_counter() - self.metadata.get('_pipeline_wall_start',
+                                                               time.perf_counter())
+            effective_remaining = max(0.0, eff_s - elapsed)
+            train_budget = min(train_budget, effective_remaining)
         deadline       = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 

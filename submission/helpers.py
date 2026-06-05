@@ -142,9 +142,20 @@ class GlobalBudgetGovernor:
         remaining    = max(0.0, self.pool_s - seconds_used)
         n_remaining  = max(1, self.n_total - n_done)
 
+        # Last dataset gets the entire remaining pool — no ceiling, no proportional split.
+        # Two datasets already ran; everything unused belongs to this one.
+        if n_remaining == 1:
+            print(f"  [GBG] last dataset → full pool alloc={remaining/3600:.2f}h")
+            return remaining
+
         if datasets_dir is not None:
             costs = self._scan_costs(meta, Path(datasets_dir))
-            if len(costs) > 1:
+            # Only use proportional split when we see MORE datasets than already done;
+            # otherwise the scan is counting finished datasets and would under-allocate.
+            if len(costs) > n_remaining:
+                # We can see all datasets but some are done — fall through to equal split
+                pass
+            elif len(costs) > 1:
                 allocs = compute_allocations(costs, remaining)
                 name   = meta.get('codename', '')
                 for k, v in allocs.items():
