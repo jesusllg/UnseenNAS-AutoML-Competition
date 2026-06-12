@@ -216,18 +216,30 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
             stage.channels_idx = prev_idx
         prev_idx = stage.channels_idx
 
-    # R9 + R10: head compatibility — use actual final spatial dims
+    # R9 + R10 + R12: head compatibility — use actual final spatial dims,
+    # accounting for neck which may collapse spatial independently of stages.
     final_h, final_w = H, W
     for stage in g.active_stages:
         final_h = _actual_spatial(final_h, stage.downsample)
         final_w = _actual_spatial(final_w, stage.downsample)
 
+    # global_avg neck collapses spatial to 1×1 before the head
+    eff_h = 1 if g.neck_type == 'global_avg' else final_h
+    eff_w = 1 if g.neck_type == 'global_avg' else final_w
+
     if g.head_type == 'FlattenMlp':
         c_out = CHANNEL_LIST[g.stages[g.n_stages - 1].channels_idx]
-        if c_out * final_h * final_w > 65536:
+        if c_out * eff_h * eff_w > 65536:
             g.head_type = 'GapLinear'
 
-    if g.head_type == 'SpatialPyramidPool' and (final_h < 4 or final_w < 4):
+    if g.head_type == 'SpatialPyramidPool' and (eff_h < 4 or eff_w < 4):
+        g.head_type = 'GapLinear'
+
+    # R12: heads that degenerate when spatial collapses to 1×1 via global_avg neck:
+    #   AttentionPool  → single token, attention weight always 1.0 → identity
+    #   GapGmpLinear   → avg and max of same 1×1 pixel → duplicate input features
+    _DEGENERATE_WITH_GLOBAL_AVG = {'AttentionPool', 'GapGmpLinear'}
+    if g.neck_type == 'global_avg' and g.head_type in _DEGENERATE_WITH_GLOBAL_AVG:
         g.head_type = 'GapLinear'
 
     # R11: memory budget guard (includes intermediates + training overhead).
