@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).parent / "submission"))
 from nas import NAS
 from data_processor import DataProcessor
 from trainer import Trainer
-from helpers import estimate_dataset_cost
+from helpers import estimate_dataset_cost, GlobalBudgetGovernor, \
+    N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS
 
 
 # ── helpers (mirrors evaluation/main.py) ─────────────────────────────────────
@@ -314,6 +315,13 @@ def main():
     pred_dir     = Path("predictions")
     pred_dir.mkdir(exist_ok=True)
 
+    # Reset GBG state at the start of every run.py invocation so a previously
+    # killed or partial test run doesn't leave stale n_done counts behind.
+    _gbg_state = pred_dir / ".global_budget.json"
+    if _gbg_state.exists():
+        _gbg_state.unlink()
+        print("  [GBG] Cleared stale state file — fresh run.")
+
     if not datasets_dir.exists():
         print(f"ERROR: datasets directory not found: {datasets_dir}")
         print("Run:  python download_datasets.py")
@@ -386,8 +394,18 @@ def main():
         elif args.time is not None:
             hours = args.time
         else:
+            # No explicit time flag — derive clock from the same GBG halving
+            # logic that NAS uses internally.  Without this, the metadata
+            # time_limit (e.g. 7 h) would be less than the GBG allocation
+            # (e.g. 11.75 h), making min(clock, GBG) = 7 h and losing the
+            # extra budget.  Reading the GBG state here (before NAS touches
+            # it) guarantees clock >= GBG allocation, so GBG controls.
+            _gbg_preview = GlobalBudgetGovernor(
+                n_total=N_COMPETITION_DATASETS,
+                total_hours=TOTAL_COMPETITION_HOURS,
+            )
             meta_preview = load_metadata(ds_path)
-            hours = meta_preview.get("time_limit", 7.0)
+            hours = _gbg_preview.get_allocation(meta_preview) / 3600
 
         ok, runtime = run_one(ds_path, args, pred_dir, hours)
         results[ds_path.name] = ok
