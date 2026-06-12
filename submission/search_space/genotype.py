@@ -16,6 +16,7 @@ BLOCK_TYPES = [
     'ChannelMixingBlock',
     'GlobalContextBlock',
     'LightAttentionBlock',
+    'GroupedBottleneckBlock',
 ]
 
 # ── Discrete option lists ──────────────────────────────────────────────────────
@@ -27,6 +28,7 @@ DILATION_LIST     = [1, 2, 3, 4]
 SE_RATIO_LIST     = [0.0625, 0.125, 0.25]
 DROPOUT_LIST      = [0.0, 0.1, 0.2, 0.3]
 DROP_PATH_LIST    = [0.0, 0.05, 0.1, 0.2]
+GROUP_W_LIST      = [4, 8, 16, 32]
 HEAD_TYPES        = ['GapLinear', 'GmpLinear', 'GapGmpLinear', 'FlattenMlp',
                      'AttentionPool', 'SpatialPyramidPool', 'GatedPool']
 STEM_TYPES        = ['conv3x3', 'conv7x7', 'conv1x1', 'double_conv']
@@ -52,6 +54,7 @@ STAGE_FIELD_CARDINALITY: Dict[str, int] = {
     'skip_mode':     len(SKIP_MODES),
     'downsample':    len(DOWNSAMPLE_OPS),
     'drop_path_idx': len(DROP_PATH_LIST),
+    'group_w_idx':   len(GROUP_W_LIST),
 }
 
 GLOBAL_FIELD_CARDINALITY: Dict[str, int] = {
@@ -80,6 +83,7 @@ class StageGene:
     skip_mode:     str  = 'residual'
     downsample:    str  = 'stride2'
     drop_path_idx: int  = 0          # index into DROP_PATH_LIST
+    group_w_idx:   int  = 2          # index into GROUP_W_LIST (default 16)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -160,6 +164,7 @@ def _rand_stage(forbidden_blocks=None) -> StageGene:
         skip_mode     = random.choice(SKIP_MODES),
         downsample    = random.choice(DOWNSAMPLE_OPS),
         drop_path_idx = random.randrange(len(DROP_PATH_LIST)),
+        group_w_idx   = random.randrange(len(GROUP_W_LIST)),
     )
 
 
@@ -216,6 +221,8 @@ def _mutate_stage_field(stage: StageGene, field_name: str) -> None:
         stage.downsample = random.choice(DOWNSAMPLE_OPS)
     elif field_name == 'drop_path_idx':
         stage.drop_path_idx = random.randrange(len(DROP_PATH_LIST))
+    elif field_name == 'group_w_idx':
+        stage.group_w_idx = random.randrange(len(GROUP_W_LIST))
 
 
 def mutate_small(g: Genotype, n_mutations: int = 1) -> Genotype:

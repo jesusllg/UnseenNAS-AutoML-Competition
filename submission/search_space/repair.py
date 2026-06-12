@@ -5,7 +5,7 @@ from .genotype import (
     Genotype, StageGene, sample_random_genotype,
     CHANNEL_LIST, KERNEL_LIST, N_BLOCKS_LIST, EXPANSION_LIST,
     DILATION_LIST, DROP_PATH_LIST, HEAD_TYPES, DOWNSAMPLE_OPS,
-    MAX_STAGES,
+    MAX_STAGES, GROUP_W_LIST,
 )
 from .family import FamilyProfile
 

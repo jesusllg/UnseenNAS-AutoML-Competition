@@ -231,6 +231,30 @@ class NAS:
             with torch.no_grad():
                 dummy = torch.randn(2, in_c, H, W).to(self.device)
                 model.to(self.device)(dummy)
+
+            # Save arch diagram + genotype JSON
+            import json
+            from pathlib import Path
+            pred_dir = Path('predictions')
+            pred_dir.mkdir(exist_ok=True)
+            codename = self.metadata.get('codename', 'unknown')
+            try:
+                geno_path = pred_dir / f'{codename}_genotype.json'
+                geno_path.write_text(json.dumps(best.genotype.to_dict(), indent=2))
+                print(f"  Genotype JSON  → {geno_path}")
+            except Exception as eg:
+                print(f"  [NAS] Genotype save failed: {eg}")
+            try:
+                from arch_viz import save_arch
+                n_p = sum(p.numel() for p in model.parameters())
+                viz_path = pred_dir / f'{codename}_arch.png'
+                ok = save_arch(best.genotype, self.metadata, viz_path,
+                               proxy_score=best.fitness, n_params=n_p)
+                if ok:
+                    print(f"  Arch diagram   → {viz_path}")
+            except Exception as ev:
+                print(f"  [NAS] Arch viz failed: {ev}")
+
             return model.cpu()
         except Exception as e:
             print(f"  [NAS] Model build failed ({e}) — using legacy fallback.")
