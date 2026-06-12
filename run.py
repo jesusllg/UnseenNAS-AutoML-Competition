@@ -357,29 +357,39 @@ def main():
     else:
         print(f"Running all {n_ds}: {[p.name for p in targets]}")
 
+    # ── Order datasets cheapest→heaviest (ALL modes) ──────────────────────────
+    # Easy/fast datasets must run first so their unused time flows to the heavy
+    # ones at the end (GBG halving gives the last dataset the entire remaining
+    # pool). Previously this sort only ran with --total-time, so in default mode
+    # the order was alphabetical and a heavy dataset like CIFARTile could run
+    # first and starve everything after it.
+    costs = {}
+    for p in targets:
+        try:
+            m = load_metadata(p)
+            costs[p.name] = estimate_dataset_cost(m, dataset_dir=p)
+        except Exception:
+            costs[p.name] = float('inf')   # unreadable metadata → assume heavy, run last
+    if args.dataset:
+        # User gave an explicit list — keep their order but warn if it's suboptimal
+        cost_order = sorted(targets, key=lambda p: costs[p.name])
+        if [p.name for p in cost_order] != [p.name for p in targets]:
+            print(f"NOTE: running in your given order. Cheapest→heaviest would be:"
+                  f" {[p.name for p in cost_order]}")
+    else:
+        targets = sorted(targets, key=lambda p: costs[p.name])
+    if len(targets) > 1:
+        print("Execution order (cheapest→heaviest):")
+        for p in targets:
+            print(f"  {p.name}: cost={costs[p.name]:,.0f}")
+
     # ── Time budget setup ─────────────────────────────────────────────────────
     budget = None
     if args.total_time is not None:
-        # Load metadata and compute geometry-based cost proxy for each dataset
-        costs = {}
-        meta_cache = {}
-        for p in targets:
-            try:
-                m = load_metadata(p)
-                meta_cache[p.name] = m
-                costs[p.name] = estimate_dataset_cost(m, dataset_dir=p)
-            except Exception:
-                costs[p.name] = 1.0
-
-        # Sort cheapest→most-expensive so surplus time flows to harder datasets
-        targets = sorted(targets, key=lambda p: costs[p.name])
-
         budget = GlobalTimeBudget(args.total_time, n_ds, args.min_time)
         per = args.total_time / n_ds
         print(f"Global budget: {args.total_time}h / {n_ds} datasets"
-              f" = ~{per:.2f}h initial each (floor {args.min_time}h) — sorted by cost:")
-        for p in targets:
-            print(f"  {p.name}: cost={costs[p.name]:.2f}")
+              f" = ~{per:.2f}h initial each (floor {args.min_time}h)")
 
     results = {}
     for ds_path in targets:
