@@ -110,12 +110,11 @@ class Trainer:
             print(traceback.format_exc())
             return self.model
         finally:
-            # Always notify GBG of completion, even on failure, so state stays consistent
+            # Always notify GBG of completion, even on failure, so state stays
+            # consistent for the next dataset. finish_dataset() is idempotent.
             gbg = self.metadata.get('_gbg')
-            if gbg is not None and not self.metadata.get('_gbg_done'):
-                self.metadata['_gbg_done'] = True   # guard against double-call
-                wall_start = self.metadata.get('_pipeline_wall_start', time.perf_counter())
-                gbg.record_done(seconds_actual=time.perf_counter() - wall_start)
+            if gbg is not None:
+                gbg.finish_dataset()
 
     def _train(self):
         set_seeds(self.metadata.get('seed', GLOBAL_SEED))
@@ -128,15 +127,12 @@ class Trainer:
         train_frac   = self.metadata.get('train_frac',   _TRAIN_FRAC)
         weight_decay = self.metadata.get('weight_decay', _WEIGHT_DECAY)
 
-        eff_s = self.metadata.get('effective_budget_s')
-        if eff_s is not None:
+        gbg = self.metadata.get('_gbg')
+        if gbg is not None:
             # GBG is active: training gets everything left of the allocated budget.
-            # elapsed already accounts for DataProcessor + NAS, so no fraction needed.
-            # clock.check() is the hard ceiling (organizer's clock).
-            elapsed = time.perf_counter() - self.metadata.get('_pipeline_wall_start',
-                                                               time.perf_counter())
-            effective_remaining = max(0.0, eff_s - elapsed)
-            train_budget = min(self.clock.check(), effective_remaining)
+            # effective_remaining() already accounts for NAS time, so no fraction
+            # needed. clock.check() is the hard ceiling (organizer's clock).
+            train_budget = min(self.clock.check(), gbg.effective_remaining())
         else:
             # Legacy fallback when GBG is not available: estimate from fractions.
             remaining_frac = max(1.0 - search_frac, 1e-6)

@@ -267,49 +267,10 @@ def _manual_fallback(name, info, reason):
 # Verification
 # ---------------------------------------------------------------------------
 
-def _sanitize_metadata_json(raw: str) -> str:
-    """
-    Coerce non-standard bare values in metadata JSON to valid JSON equivalents.
-
-    Competition datasets (especially Edinburgh DataShare) sometimes ship
-    metadata files with values that are legal in Python, R, YAML, or
-    JavaScript but not in strict JSON.  All of the following are replaced
-    with JSON null (or the correct JSON boolean) so json.loads never fails.
-
-    Null-like  →  null
-        ?           (missing, common in spreadsheet exports)
-        NA / N/A    (R / pandas missing)
-        NaN / nan   (IEEE 754 — not in JSON spec)
-        Inf / -Inf / Infinity / -Infinity / inf / -inf   (IEEE 754)
-        None        (Python)
-        undefined   (JavaScript)
-
-    Boolean  →  true / false
-        True / False  (Python capitalised booleans)
-
-    Quoted string values like "benchmark": "NA" are left completely untouched
-    because the patterns only match *unquoted* bare tokens that appear between
-    the colon and the next structural character (, } ] or newline).
-    """
-    # Build the pattern for null-like bare tokens (lookahead preserves the
-    # trailing structural character so we don't have to re-insert it).
-    _NULL_TOKENS = (
-        r'\?'                           # ?
-        r'|N/A|NA'                      # R / spreadsheet
-        r'|NaN|nan'                     # IEEE NaN
-        r'|[+-]?[Ii]nfinity|[+-]?[Ii]nf'  # IEEE Inf variants
-        r'|None'                        # Python
-        r'|undefined'                   # JavaScript
-    )
-    raw = re.sub(
-        r':\s*(?:' + _NULL_TOKENS + r')(?=\s*[,}\]\r\n])',
-        ': null',
-        raw,
-    )
-    # Python capitalised booleans
-    raw = re.sub(r':\s*True(?=\s*[,}\]\r\n])',  ': true',  raw)
-    raw = re.sub(r':\s*False(?=\s*[,}\]\r\n])', ': false', raw)
-    return raw
+# Single shared implementation lives in submission/helpers.py — see
+# sanitize_metadata_json there for the full token table and rationale.
+sys.path.insert(0, str(Path(__file__).parent / "submission"))
+from helpers import sanitize_metadata_json as _sanitize_metadata_json  # noqa: E402
 
 
 def _verify(name, dataset_dir, time_limit_hours=None):
