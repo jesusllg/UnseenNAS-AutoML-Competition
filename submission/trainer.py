@@ -22,11 +22,11 @@ _WEIGHT_DECAY = 1e-4
 # Early stopping defaults
 _ES_ENABLED          = True
 _ES_PATIENCE         = 20     # consecutive regression epochs before stopping
-_ES_PLATEAU_PATIENCE = 15     # consecutive plateau epochs before stopping
+_ES_PLATEAU_PATIENCE = 20     # consecutive plateau epochs before stopping
 _ES_MIN_EPOCHS       = 10     # warmup: ES cannot trigger before this epoch
-_ES_DELTA_START      = 0.005  # initial improvement threshold (0.5 pp)
+_ES_DELTA_START      = 0.002  # initial improvement threshold (0.2 pp)
 _ES_DELTA_MIN        = 0.001  # floor for improvement delta (0.1 pp)
-_ES_DELTA_DECAY      = 5      # improvements before halving delta
+_ES_DELTA_DECAY      = 3      # improvements before halving delta
 _ES_REGRESSION_DELTA = 0.010  # fall >1 pp below best → counts as bad epoch
 
 
