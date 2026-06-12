@@ -6,6 +6,7 @@ from .genotype import (
     Genotype, StageGene,
     CHANNEL_LIST, KERNEL_LIST, N_BLOCKS_LIST, EXPANSION_LIST,
     DILATION_LIST, SE_RATIO_LIST, DROPOUT_LIST, DROP_PATH_LIST,
+    GROUP_W_LIST,
 )
 from .block_library import BLOCK_REGISTRY, make_norm, make_act
 
@@ -256,6 +257,7 @@ def _build_stage(gene: StageGene, c_in: int, norm_type: str,
     se         = bool(gene.se_enabled)
     se_ratio   = SE_RATIO_LIST[gene.se_ratio_idx]
     drop_path  = DROP_PATH_LIST[gene.drop_path_idx]
+    group_w    = GROUP_W_LIST[gene.group_w_idx]
     downsample_op = gene.downsample
 
     # Separate pooling or strided-in-block
@@ -277,6 +279,7 @@ def _build_stage(gene: StageGene, c_in: int, norm_type: str,
             se        = se,
             se_ratio  = se_ratio,
             drop_path = drop_path,
+            group_w   = group_w,
         ))
 
     if len(layers) == 0:
