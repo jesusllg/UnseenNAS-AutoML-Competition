@@ -245,8 +245,15 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
     # R11: memory budget guard (includes intermediates + training overhead).
     # Apply up to 3 rounds of channel reduction so a single repair pass can
     # catch severely oversized genotypes without needing repeated calls.
+    #
+    # Estimate at the SAME batch size DataProcessor will actually use at train
+    # time (its rule keyed on pixel count). Previously hardcoded to 32 while wide
+    # inputs like Cryptic (6×768 → 4608 px) train at batch 64 → a silent 2×
+    # underestimate that let oversized models slip through and OOM the trainer.
+    pixels = C * H * W
+    train_bs = 16 if pixels > 100_000 else (32 if pixels > 10_000 else 64)
     for _shrink in range(3):
-        mem_mb = estimate_activations_mb(g, C, H, W, batch_size=32)
+        mem_mb = estimate_activations_mb(g, C, H, W, batch_size=train_bs)
         if mem_mb <= memory_budget_mb:
             break
         # Reduce expansion first (cheapest quality loss), then channels, then stages
