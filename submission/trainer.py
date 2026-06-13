@@ -118,6 +118,13 @@ class Trainer:
 
     def _train(self):
         set_seeds(self.metadata.get('seed', GLOBAL_SEED))
+        # Release any CUDA memory pool fragmentation left by the NAS search phase
+        # before loading the training model. Without this, 100+ NAS evaluations
+        # can leave ~10-20 GB of fragmented reserved memory that OOMs GroupNorm.
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.model.to(self.device)
 
         # Complementary fractions of the TOTAL clock budget:

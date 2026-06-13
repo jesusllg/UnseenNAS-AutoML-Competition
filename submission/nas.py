@@ -255,6 +255,12 @@ class NAS:
             except Exception as ev:
                 print(f"  [NAS] Arch viz failed: {ev}")
 
+            # Release the NAS search memory pool before handing off to training.
+            # 100+ architecture evaluations fragment the CUDA allocator pool.
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return model.cpu()
         except Exception as e:
             print(f"  [NAS] Model build failed ({e}) — using legacy fallback.")

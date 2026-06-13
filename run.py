@@ -255,15 +255,15 @@ def main():
                     help="Consecutive non-improving epochs before stopping. (default: 20)")
     ap.add_argument("--es-min-epochs",   type=int,   default=10,
                     help="Minimum epochs before ES can trigger. (default: 10)")
-    ap.add_argument("--es-delta-start",  type=float, default=0.005,
-                    help="Initial min-improvement threshold. (default: 0.005 = 0.5pp)")
+    ap.add_argument("--es-delta-start",  type=float, default=0.002,
+                    help="Initial min-improvement threshold. (default: 0.002 = 0.2pp)")
     ap.add_argument("--es-delta-min",    type=float, default=0.001,
                     help="Floor for delta after decay. (default: 0.001 = 0.1pp)")
-    ap.add_argument("--es-delta-decay",       type=int,   default=5,
-                    help="Improvements before halving delta. (default: 5)")
-    ap.add_argument("--es-plateau-patience", type=int,   default=15,
-                    help="Consecutive plateau epochs before stopping. (default: 15)")
-    ap.add_argument("--es-regression-delta", type=float, default=0.005,
+    ap.add_argument("--es-delta-decay",       type=int,   default=3,
+                    help="Improvements before halving delta. (default: 3)")
+    ap.add_argument("--es-plateau-patience", type=int,   default=20,
+                    help="Consecutive plateau epochs before stopping. (default: 20)")
+    ap.add_argument("--es-regression-delta", type=float, default=0.010,
                     help="Fall >X below best to count as bad epoch. (default: 0.010 = 1pp)")
     args = ap.parse_args()
 
