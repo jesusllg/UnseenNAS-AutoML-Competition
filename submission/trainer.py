@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch import optim
 from sklearn.metrics import accuracy_score
 
-from helpers import show_time, set_seeds, GLOBAL_SEED
+from helpers import show_time, set_seeds, GLOBAL_SEED, free_gpu
 
 # train_frac is a fraction of the TOTAL clock budget (not of remaining time).
 # search_frac + train_frac should sum to ≤ 0.95, leaving ~5% for predict/overhead.
@@ -118,13 +118,8 @@ class Trainer:
 
     def _train(self):
         set_seeds(self.metadata.get('seed', GLOBAL_SEED))
-        # Release any CUDA memory pool fragmentation left by the NAS search phase
-        # before loading the training model. Without this, 100+ NAS evaluations
-        # can leave ~10-20 GB of fragmented reserved memory that OOMs GroupNorm.
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Start training with the NAS search phase's idle GPU memory reclaimed.
+        free_gpu()
         self.model.to(self.device)
 
         # Complementary fractions of the TOTAL clock budget:
@@ -295,8 +290,7 @@ class Trainer:
                 return torch.cat(outs, dim=0)
             except torch.cuda.OutOfMemoryError:
                 optimizer.zero_grad(set_to_none=True)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                free_gpu()
                 new_chunk = max(1, chunk // 2)
                 if new_chunk == chunk:   # already at 1 and still OOM
                     raise RuntimeError(

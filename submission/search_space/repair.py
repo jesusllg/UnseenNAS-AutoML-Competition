@@ -47,6 +47,26 @@ def _actual_spatial(h: int, ds: str) -> int:
     return max(1, h // 2)     # floor — MaxPool2d / AvgPool2d
 
 
+def _block_mid_channels(block_type: str, c_in: int, c_out: int, expand: int) -> int:
+    """
+    The largest intermediate channel count a block actually materialises, taken
+    directly from each block's forward in block_library.py. This must stay in
+    sync with the blocks — it is what lets the memory guard see a block for its
+    real cost instead of assuming every block expands uniformly (the blind spot
+    that let GroupedBottleneck's old 6× expansion OOM training undetected).
+
+    Only MBConv and ChannelMixing expand; Bottleneck compresses; every other
+    block (incl. the constant-width GroupedBottleneck) runs at c_out.
+    """
+    if block_type == 'MBConvBlock':
+        return max(c_in, c_in * expand)
+    if block_type == 'ChannelMixingBlock':
+        return max(c_in, c_out * expand)
+    if block_type == 'BottleneckBlock':
+        return max(1, c_out // expand)
+    return c_out
+
+
 def estimate_activations_mb(genotype: Genotype, C: int, H: int, W: int,
                              batch_size: int = 32) -> float:
     """
@@ -54,8 +74,8 @@ def estimate_activations_mb(genotype: Genotype, C: int, H: int, W: int,
 
     Accounts for:
       - Output activation of each stage (stored for backward pass)
-      - Intermediate expanded activations within blocks (MBConv/ChannelMixing
-        can expand channels by 4–6×, dominating memory at large spatial dims)
+      - Intermediate activation within blocks, sized per block type (only MBConv
+        and ChannelMixing expand channels; see _block_mid_channels)
       - Training factor ×3 for backward gradients + Adam m/v states
     """
     from .genotype import CHANNEL_LIST, EXPANSION_LIST, N_BLOCKS_LIST
@@ -74,11 +94,8 @@ def estimate_activations_mb(genotype: Genotype, C: int, H: int, W: int,
         # Output activation (must be kept for backward pass)
         total_elements += batch_size * c_out * h * w
 
-        # Intermediate expanded activation within each block.
-        # MBConvBlock: c_in → c_in*expand → c_out
-        # ChannelMixingBlock: c_in → max(c_in, c_out*expand) → c_out
-        # Use the most conservative (largest) intermediate estimate.
-        c_mid = max(c_in * expand, c_out * expand)
+        # Intermediate activation within each block, sized by its real forward.
+        c_mid = _block_mid_channels(gene.block_type, c_in, c_out, expand)
         total_elements += batch_size * c_mid * h * w * n_blk
 
         c_in = c_out
@@ -246,12 +263,11 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
     # Apply up to 3 rounds of channel reduction so a single repair pass can
     # catch severely oversized genotypes without needing repeated calls.
     #
-    # Estimate at the SAME batch size DataProcessor will actually use at train
-    # time (its rule keyed on pixel count). Previously hardcoded to 32 while wide
-    # inputs like Cryptic (6×768 → 4608 px) train at batch 64 → a silent 2×
-    # underestimate that let oversized models slip through and OOM the trainer.
-    pixels = C * H * W
-    train_bs = 16 if pixels > 100_000 else (32 if pixels > 10_000 else 64)
+    # Estimate at the SAME batch size DataProcessor will train with (shared rule
+    # in helpers.select_batch_size). A mismatch here is a silent under/over
+    # estimate — e.g. wide Cryptic (6×768) trains at batch 64, not 32.
+    from helpers import select_batch_size
+    train_bs = select_batch_size(C, H, W)
     for _shrink in range(3):
         mem_mb = estimate_activations_mb(g, C, H, W, batch_size=train_bs)
         if mem_mb <= memory_budget_mb:

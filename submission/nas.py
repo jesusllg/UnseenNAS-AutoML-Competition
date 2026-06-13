@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from helpers import (show_time, set_seeds, GLOBAL_SEED,
+from helpers import (show_time, set_seeds, GLOBAL_SEED, free_gpu,
                      GlobalBudgetGovernor,
                      N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS)
 
@@ -115,10 +115,7 @@ class NAS:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Release any GPU memory the previous dataset may have left behind
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        free_gpu()
 
         # ── Global Budget Governor ────────────────────────────────────────────
         # The governor owns the whole budget lifecycle (allocation, wall clock,
@@ -156,7 +153,7 @@ class NAS:
         tourney_k = self.metadata.get('tournament_size', _TOURNAMENT_SIZE)
         search_frac   = self.metadata.get('search_frac', _SEARCH_FRAC)
         # Cap search to our effective per-dataset budget, not just clock remaining
-        search_budget = min(self.clock.check(), self._gbg.allocation_s) * search_frac
+        search_budget = min(self.clock.check(), self._gbg.current_allocation()) * search_frac
         t_search_start = time.perf_counter()
         print(f"  NAS | sf={search_frac:.2f} → budget={show_time(search_budget)}"
               f"  pop={n_pop} rounds={n_rounds} | device={self.device}")
@@ -255,12 +252,8 @@ class NAS:
             except Exception as ev:
                 print(f"  [NAS] Arch viz failed: {ev}")
 
-            # Release the NAS search memory pool before handing off to training.
-            # 100+ architecture evaluations fragment the CUDA allocator pool.
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Release the NAS search memory before handing the model to training.
+            free_gpu()
             return model.cpu()
         except Exception as e:
             print(f"  [NAS] Model build failed ({e}) — using legacy fallback.")
@@ -310,8 +303,7 @@ class NAS:
                     best_model = copy.deepcopy(model).cpu()
             except RuntimeError as e:
                 print(f"  Architecture skipped: {e}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                free_gpu()
 
         if best_model is None:
             best_model = SearchableCNN(in_c, n_cls, _FALLBACK['medium'], hw)

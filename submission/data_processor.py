@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import torchvision.transforms as transforms
 
+from helpers import select_batch_size
+
 
 class _Dataset(torch.utils.data.Dataset):
     def __init__(self, x, y, transform=None):
@@ -66,15 +68,9 @@ class DataProcessor:
 
         eval_transform = transforms.Compose([normalize])
 
-        # Smaller batches for large images to avoid OOM
-        pixels = h * w * x.shape[1]
-        if pixels > 100_000:
-            batch_size = 16
-        elif pixels > 10_000:
-            batch_size = 32
-        else:
-            batch_size = 64
-
+        # Smaller batches for large images to avoid OOM (shared rule so repair's
+        # memory estimate is computed at the exact batch we train with).
+        batch_size = select_batch_size(x.shape[1], h, w)
         self.metadata['batch_size'] = batch_size
 
         train_ds = _Dataset(self.train_x, self.train_y, transform=train_transform)

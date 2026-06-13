@@ -44,6 +44,41 @@ def div_remainder(n, interval):
     return factor, remainder
 
 
+# ── Hardware/runtime helpers (single source of truth) ────────────────────────
+
+def select_batch_size(C: int, H: int, W: int) -> int:
+    """
+    THE batch-size rule, keyed on input pixel count (channels × H × W).
+
+    One definition used by both sides so they can never disagree:
+      • DataProcessor builds the loaders with it.
+      • repair.py estimates training memory with it, so the estimate matches
+        the batch the trainer will actually run (a mismatch here silently
+        under/over-estimates memory and lets oversized models OOM the trainer).
+    """
+    pixels = C * H * W
+    if pixels > 100_000:
+        return 16
+    if pixels > 10_000:
+        return 32
+    return 64
+
+
+def free_gpu() -> None:
+    """
+    THE GPU-memory reclaim idiom: drop unreferenced Python tensors, then return
+    the CUDA caching allocator's unused blocks to the driver.
+
+    Call at phase boundaries (entering NAS, handing a model from search to
+    training, after an OOM) so the next phase starts without the previous
+    phase's reserved-but-idle memory inflating the allocator's footprint.
+    """
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def show_time(seconds):
     if seconds < 60:
         return "{:.2f}s".format(seconds)
@@ -206,6 +241,16 @@ class GlobalBudgetGovernor:
         self.allocation_s = self.get_allocation()
         self._state['current'] = dataset_name
         self._save()
+        return self.allocation_s
+
+    def current_allocation(self) -> float:
+        """
+        This dataset's allocation in seconds. Computes it on demand if
+        begin_dataset() hasn't run yet, so callers can never read a None
+        allocation (defensive — normal flow sets it in begin_dataset()).
+        """
+        if self.allocation_s is None:
+            self.allocation_s = self.get_allocation()
         return self.allocation_s
 
     def elapsed(self) -> float:

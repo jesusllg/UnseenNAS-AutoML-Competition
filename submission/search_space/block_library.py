@@ -358,12 +358,22 @@ class LightAttentionBlock(nn.Module):
 
 
 class GroupedBottleneckBlock(nn.Module):
-    """RegNet X-block: 1×1 expand → 3×3 grouped conv → 1×1 project."""
+    """
+    RegNet X-block: 1×1 → 3×3 grouped conv → 1×1, at constant width c_mid = c_out.
+
+    A true RegNetX block does NOT expand channels — the grouped convolution IS
+    the efficiency mechanism (params drop with the group count), so the middle
+    width equals the output width (bottleneck ratio b=1, the RegNetX default).
+    The `expansion` gene is intentionally ignored here: multiplying width by up
+    to 6× would make this the heaviest block in the library and, on wide inputs
+    (e.g. 6×768), produce multi-GB intermediates that OOM training. group_w is
+    the searchable knob that actually defines this block family.
+    """
     def __init__(self, c_in, c_out, kernel=3, stride=1, dilation=1,
                  group_w=16, expansion=1, norm_type='batch', act_type='relu',
                  se=False, se_ratio=0.25, drop_path=0.0, **kw):
         super().__init__()
-        c_mid = max(c_out, int(c_out * expansion))
+        c_mid = c_out
         pad = (kernel // 2) * dilation
         # Walk down from c_mid//group_w to find a valid group count
         g = max(1, c_mid // group_w)
