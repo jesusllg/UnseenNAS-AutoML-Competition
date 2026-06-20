@@ -87,15 +87,8 @@ _FALLBACK = {
 
 # ── Search helpers ────────────────────────────────────────────────────────────
 
-_N_POPULATION    = 100
-_N_ROUNDS        = 2000   # effectively "run until time budget expires"
-# Selection intensity = tournament / population. Real et al. used 25/100 with a
-# TRUE-accuracy fitness; our zero-cost proxy is far noisier, so the same high
-# pressure over a long search exploits proxy noise (it gates on the proxy's
-# mistakes) and over-converges to proxy-gaming, over-shrunk architectures.
-# 10/100 keeps more diversity / exploration and is more robust to that noise.
-_TOURNAMENT_SIZE = 25
-_SEARCH_FRAC     = 0.30
+# Pipeline hyperparameters: single source of truth in config.py.
+from config import (NAS_POPULATION, NAS_ROUNDS, NAS_TOURNAMENT, SEARCH_FRAC)
 
 
 def _get_proxy_batch(train_loader, device, batch_size=16):
@@ -153,10 +146,10 @@ class NAS:
         H, W  = shape[2], shape[3]
         n_cls = self.metadata['num_classes']
 
-        n_pop       = _N_POPULATION
-        n_rounds    = _N_ROUNDS
-        tourney_k   = _TOURNAMENT_SIZE
-        search_frac = _SEARCH_FRAC
+        n_pop       = NAS_POPULATION
+        n_rounds    = NAS_ROUNDS
+        tourney_k   = NAS_TOURNAMENT
+        search_frac = SEARCH_FRAC
         # Cap search to our effective per-dataset budget, not just clock remaining
         search_budget = min(self.clock.check(), self._gbg.current_allocation()) * search_frac
         t_search_start = time.perf_counter()

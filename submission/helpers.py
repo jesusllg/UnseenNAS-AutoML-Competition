@@ -9,13 +9,11 @@ import numpy as np
 import torch
 
 
-GLOBAL_SEED = 42
-
-# ── Competition-wide time constants ──────────────────────────────────────────
-
-N_COMPETITION_DATASETS     = 3     # known: 3 datasets
-TOTAL_COMPETITION_HOURS    = 24.0  # known: 24h total budget
-COMPETITION_OVERHEAD_HOURS = 0.5   # safety margin for I/O, imports, scoring
+# Reproducibility + competition facts live in config.py (the single source of
+# truth). Re-exported here so existing `from helpers import GLOBAL_SEED` etc.
+# keep working unchanged.
+from config import (GLOBAL_SEED, N_COMPETITION_DATASETS,
+                    TOTAL_COMPETITION_HOURS, COMPETITION_OVERHEAD_HOURS)
 
 _FAMILY_COST_WEIGHT = {
     'small_grid':          0.40,

@@ -13,21 +13,12 @@ from sklearn.metrics import accuracy_score
 
 from helpers import show_time, set_seeds, GLOBAL_SEED, free_gpu
 
-# train_frac is a fraction of the TOTAL clock budget (not of remaining time).
-# search_frac + train_frac should sum to ≤ 0.95, leaving ~5% for predict/overhead.
-_TRAIN_FRAC   = 0.65
-_SEARCH_FRAC  = 0.30   # kept here only as the default denominator reference
-_WEIGHT_DECAY = 1e-4
-
-# Early stopping defaults
-_ES_ENABLED          = True
-_ES_PATIENCE         = 20     # consecutive regression epochs before stopping
-_ES_PLATEAU_PATIENCE = 20     # consecutive plateau epochs before stopping
-_ES_MIN_EPOCHS       = 10     # warmup: ES cannot trigger before this epoch
-_ES_DELTA_START      = 0.002  # initial improvement threshold (0.2 pp)
-_ES_DELTA_MIN        = 0.001  # floor for improvement delta (0.1 pp)
-_ES_DELTA_DECAY      = 3      # improvements before halving delta
-_ES_REGRESSION_DELTA = 0.010  # fall >1 pp below best → counts as bad epoch
+# Pipeline hyperparameters: single source of truth in config.py.
+from config import (
+    SEARCH_FRAC, TRAIN_FRAC, WEIGHT_DECAY,
+    ES_ENABLED, ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
+    ES_DELTA_START, ES_DELTA_MIN, ES_DELTA_DECAY, ES_REGRESSION_DELTA,
+)
 
 
 class _EarlyStopper:
@@ -125,7 +116,7 @@ class Trainer:
         # Complementary fractions of the TOTAL clock budget:
         #   search_frac takes X% of total at NAS time
         #   train_frac  is also a fraction of total — we recover it from remaining time
-        weight_decay = _WEIGHT_DECAY
+        weight_decay = WEIGHT_DECAY
 
         gbg = self.metadata.get('_gbg')
         if gbg is not None:
@@ -135,15 +126,15 @@ class Trainer:
             train_budget = min(self.clock.check(), gbg.effective_remaining())
         else:
             # Legacy fallback when GBG is not available: estimate from fractions.
-            remaining_frac = max(1.0 - _SEARCH_FRAC, 1e-6)
-            train_budget   = self.clock.check() * (_TRAIN_FRAC / remaining_frac)
+            remaining_frac = max(1.0 - SEARCH_FRAC, 1e-6)
+            train_budget   = self.clock.check() * (TRAIN_FRAC / remaining_frac)
         deadline = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 
         # Early stopping (regression-based with dynamic improvement delta)
-        stopper = _EarlyStopper(_ES_PATIENCE, _ES_PLATEAU_PATIENCE, _ES_MIN_EPOCHS,
-                                _ES_DELTA_START, _ES_DELTA_MIN,
-                                _ES_DELTA_DECAY, _ES_REGRESSION_DELTA, _ES_ENABLED)
+        stopper = _EarlyStopper(ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
+                                ES_DELTA_START, ES_DELTA_MIN,
+                                ES_DELTA_DECAY, ES_REGRESSION_DELTA, ES_ENABLED)
         stopper = _EarlyStopper(es_patience, es_plateau_patience, es_min_epochs,
                                 es_delta_start, es_delta_min,
                                 es_delta_decay, es_regression_delta, es_enabled)
