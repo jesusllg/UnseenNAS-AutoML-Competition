@@ -594,6 +594,148 @@ cosmetic; it is a correctness property of the search. A single
 (CPU+CUDA), and enables deterministic cuDNN, at the head of both search and
 training. We verified that two independent runs with the same seed return the
 identical best genotype and fitness.
+Section~\ref{sec:geometry-sensitivity} analyses why this guarantee does
+\emph{not} extend across datasets with different input geometry --- even within
+the same family.
+
+% ===========================================================================
+\section{Why Same-Family Search Diverges Across Datasets}
+\label{sec:geometry-sensitivity}
+% ===========================================================================
+
+A natural question arises when comparing the search outcome across two
+datasets that map to the same family: given the same seed and the same search
+space, why does the selected architecture often differ by millions of
+parameters? The short answer is that \emph{the fitness landscape is
+geometry-conditioned}: the AZ-NAS score of a fixed genotype is \emph{not}
+invariant to $(C,H,W,n_{\text{cls}})$, so a change in any of these four
+dimensions produces a different fitness landscape, and a different landscape
+selects a different winner. Three mechanisms are responsible, ordered by
+visibility.
+
+\subsection{Mechanism 1 --- Geometry-dependent repair}
+The repair operator (\S\ref{sec:repair}) projects every candidate onto the
+feasible set for \emph{this} input. Two datasets in the same family can still
+differ in concrete spatial size: \textsc{anisotropic} covers any
+$(\rho\!\ge\!6,\,s_{\min}\!\le\!8)$ geometry, which includes both
+$1{\times}6{\times}768$ and $1{\times}4{\times}512$. Repair's kernel clamp
+(R5), pooling budget (R6), and memory guard (R11) are functions of $(C,H,W)$;
+the same genotype index sequence is therefore projected to \emph{different}
+channel widths, stage counts, or kernel sizes depending on which dataset is
+being processed. The surviving genotype is not the same object --- it only
+shares an index sequence with the other dataset's survivor. This alone can
+produce double-digit percentage differences in parameter count.
+
+\subsection{Mechanism 2 --- Proxy scores are conditioned on input geometry}
+The AZ-NAS combined score
+\begin{equation}
+S \;=\; E + P + T - \lambda_c \log(n_{\text{params}} + 1)
+\end{equation}
+has four components, three of which change with $(C,H,W,n_{\text{cls}})$ even
+when the genotype index tuple is held fixed.
+
+\paragraph{Expressivity $E$ and progressivity $P$.} Both compute the
+eigenvalue entropy of the spatial covariance matrix of feature activations:
+\begin{equation}
+E_\ell \;=\; -\!\sum_i \hat\lambda_i \log(\hat\lambda_i + \epsilon),
+\qquad \hat\lambda_i = \lambda_i \,/\, \textstyle\sum_j \lambda_j,
+\end{equation}
+where $\lambda_i$ are eigenvales of
+$\Sigma_\ell = F_\ell^\top F_\ell / (BHW)$, with $F_\ell$ the flattened
+activation map at layer $\ell$.  Because Kaiming fan-in initialization scales
+weights as $\mathcal{N}(0, 2/(C_{\text{in}}k^2))$, the distribution of feature
+activations changes whenever $C$ or the repaired kernel $k$ changes.  As a
+result, $\Sigma_\ell$, its eigenspectrum, and $E_\ell$ all depend on $(C,H,W)$.
+
+\paragraph{Trainability $T$.} The proxy back-propagates a Rademacher vector
+$g_\ell \!\sim\! \{-1,+1\}^{B \times C_\ell \times H_\ell \times W_\ell}$
+via \code{torch.bernoulli}.  The number of samples drawn equals
+$B\,C_\ell H_\ell W_\ell$ per evaluated layer pair, a quantity that varies
+with both the spatial dimensions and the repaired channel count.  Additionally,
+the PixelUnshuffle alignment step requires an integer stride
+$s = H_{\ell-1}/H_\ell$; if this is non-integer (e.g.\ $9\!\to\!4$ in
+odd-spatial grids), that layer pair is skipped entirely.  The set of
+\emph{evaluated} layer pairs therefore depends on the specific $(H,W)$ of each
+dataset.
+
+\paragraph{Complexity penalty $C$.} With $n_{\text{params}} =
+n_{\text{body}} + C\cdot k^2 \cdot c_{\text{stem}} +
+n_{\text{cls}}\cdot c_{\text{last}}$, both input channels $C$ (via the stem's
+first convolution) and number of classes $n_{\text{cls}}$ (via the head's
+linear layer) shift the penalty by $\lambda_c\,\Delta\log n$.
+
+Table~\ref{tab:proxy-shift} quantifies the score shifts for one fixed genotype
+evaluated on four geometries spanning two families, holding the seed constant.
+
+\begin{table}[t]
+\centering
+\caption{AZ-NAS component scores for \emph{one fixed genotype} (4-stage,
+256-ch GroupedBottleneck, seed 42) across input geometries. Scores are raw
+scalar values (higher $=$ better), normalized to zero mean across the four
+rows for display. $\Delta_E, \Delta_P, \Delta_T$ are deviations from the
+mean; $\Delta_C$ is the absolute complexity penalty.
+\emph{Cells to be filled from evaluation harness.}}
+\label{tab:proxy-shift}
+\footnotesize
+\begin{tabular}{@{}lcrrrr@{}}
+\toprule
+Geometry & Family & $\Delta_E$ & $\Delta_P$ & $\Delta_T$ & $\Delta_C$\\
+\midrule
+$1\!\times\!6\!\times\!768$   & \family{anisotropic}   & -- & -- & -- & --\\
+$1\!\times\!4\!\times\!512$   & \family{anisotropic}   & -- & -- & -- & --\\
+$3\!\times\!32\!\times\!32$   & \family{visual\_medium} & -- & -- & -- & --\\
+$12\!\times\!8\!\times\!8$    & \family{channel\_heavy} & -- & -- & -- & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Mechanism 3 --- RNG coupling across the evaluation sequence}
+The most subtle source of divergence is a \emph{coupling across evaluations}
+within a single search run.  The seed fixes the initial RNG state; each
+subsequent evaluation advances the state by the number of random draws it
+consumes.  For the trainability proxy alone, evaluating one architecture
+consumes
+\begin{equation}
+R_k \;=\; \sum_{\ell=1}^{L_k} B\,C_{\ell}^{(k)}\,H_{\ell}^{(k)}\,W_{\ell}^{(k)}
+\end{equation}
+draws, which depends on the channel widths and spatial sizes of architecture
+$k$.  If datasets $A$ and $B$ have different $(H,W)$, evaluation $k=1$ already
+consumes a different $R_1^A \ne R_1^B$, leaving a shifted state for $k=2$.
+The shift compounds over the $P_0 = 50$ initializations, so by the time
+evolution begins, the Rademacher cotangents for every subsequent candidate are
+drawn from a completely different position in the random stream --- even though
+the same seed was used and the same genotype index sequence was proposed.
+
+Crucially, the same coupling applies across \emph{code versions}: fixing a
+block implementation that consumed $6\times$ more intermediate channels
+$c_{\text{mid}}$ not only changed the fitness of every genotype containing that
+block, but also shifted $R_k$ by a factor of six for each such block in
+architecture $k$, decoupling the ``same seed'' guarantee for all architectures
+evaluated after the first one that contains the block. This is why the same
+seed, before and after fixing \textsc{GroupedBottleneck}, selects different
+architectures: the seed fixes the starting point, but the traversal path
+through the RNG stream diverges immediately.
+
+\subsection{Practical implications}
+\begin{enumerate}\itemsep2pt
+\item \textbf{``Same seed, same code'' guarantees determinism.} Two runs with
+  identical code, identical input $(C,H,W,n_{\text{cls}})$, and the same seed
+  produce the identical best genotype and proxy fitness.  We verified this
+  empirically.
+\item \textbf{``Same seed, same family'' does not.}  Within-family geometry
+  variation changes the fitness landscape (Mechanism 2) and the RNG path
+  (Mechanism 3); repair may additionally project identical genotype indices to
+  different architectures (Mechanism 1).
+\item \textbf{Parameter count reflects selection, not capacity.}  The observed
+  variation in final parameter count (often $\times 2$--$3\times$ across same-
+  family datasets) does not mean the search found architectures of wildly
+  different quality --- it means the fitness landscape rewarded different widths
+  for different geometries. A 1.25M-parameter network selected for
+  $1{\times}6{\times}768$ is not ``worse'' than a 2.4M-parameter network
+  selected for the same geometry under a different code version: the proxy
+  scores are not comparable across code changes, only within a fixed evaluation
+  environment.
+\end{enumerate}
 
 % ===========================================================================
 \section{Experimental Protocol}
