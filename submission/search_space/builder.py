@@ -14,33 +14,33 @@ from .block_library import BLOCK_REGISTRY, make_norm, make_act
 # ── Stem builders ─────────────────────────────────────────────────────────────
 
 def build_stem(stem_type: str, c_in: int, c_out: int,
-               norm_type: str = 'batch') -> nn.Module:
+               norm_type: str = 'batch', act_type: str = 'relu') -> nn.Module:
     if stem_type == 'conv7x7':
         return nn.Sequential(
             nn.Conv2d(c_in, c_out, 7, stride=1, padding=3, bias=False),
             make_norm(c_out, norm_type),
-            nn.ReLU(inplace=True),
+            make_act(act_type),
         )
     elif stem_type == 'conv1x1':
         return nn.Sequential(
             nn.Conv2d(c_in, c_out, 1, bias=False),
             make_norm(c_out, norm_type),
-            nn.ReLU(inplace=True),
+            make_act(act_type),
         )
     elif stem_type == 'double_conv':
         return nn.Sequential(
             nn.Conv2d(c_in, c_out, 3, padding=1, bias=False),
             make_norm(c_out, norm_type),
-            nn.ReLU(inplace=True),
+            make_act(act_type),
             nn.Conv2d(c_out, c_out, 3, padding=1, bias=False),
             make_norm(c_out, norm_type),
-            nn.ReLU(inplace=True),
+            make_act(act_type),
         )
     else:  # 'conv3x3'
         return nn.Sequential(
             nn.Conv2d(c_in, c_out, 3, padding=1, bias=False),
             make_norm(c_out, norm_type),
-            nn.ReLU(inplace=True),
+            make_act(act_type),
         )
 
 
@@ -246,7 +246,7 @@ class SearchSpaceModel(nn.Module):
 # ── Stage builder ─────────────────────────────────────────────────────────────
 
 def _build_stage(gene: StageGene, c_in: int, norm_type: str,
-                 aniso_axis=None) -> Tuple[nn.Module, nn.Module, int]:
+                 aniso_axis=None, act_type: str = 'relu') -> Tuple[nn.Module, nn.Module, int]:
     """Returns (downsample_or_None, stage_module, c_out)."""
     block_cls  = BLOCK_REGISTRY[gene.block_type]
     kernel     = KERNEL_LIST[gene.kernel_idx]
@@ -276,6 +276,7 @@ def _build_stage(gene: StageGene, c_in: int, norm_type: str,
             dilation  = dilation,
             expansion = expansion,
             norm_type = norm_type,
+            act_type  = act_type,
             se        = se,
             se_ratio  = se_ratio,
             drop_path = drop_path,
@@ -287,7 +288,7 @@ def _build_stage(gene: StageGene, c_in: int, norm_type: str,
         layers.append(nn.Sequential(
             nn.Conv2d(c_in, c_out, 1, stride=stride, bias=False),
             make_norm(c_out, norm_type),
-            nn.ReLU(inplace=True),
+            make_act(act_type),
         ))
 
     return ds_module, nn.Sequential(*layers), c_out
@@ -295,12 +296,13 @@ def _build_stage(gene: StageGene, c_in: int, norm_type: str,
 
 # ── Neck ──────────────────────────────────────────────────────────────────────
 
-def build_neck(neck_type: str, c_in: int, norm_type: str) -> nn.Module:
+def build_neck(neck_type: str, c_in: int, norm_type: str,
+               act_type: str = 'relu') -> nn.Module:
     if neck_type == 'conv1x1':
         return nn.Sequential(
             nn.Conv2d(c_in, c_in, 1, bias=False),
             make_norm(c_in, norm_type),
-            nn.ReLU(inplace=True),
+            make_act(act_type),
         )
     elif neck_type == 'global_avg':
         return nn.AdaptiveAvgPool2d(1)
@@ -312,10 +314,11 @@ def build_neck(neck_type: str, c_in: int, norm_type: str) -> nn.Module:
 def build_model(genotype: Genotype, C: int, H: int, W: int,
                 num_classes: int, aniso_axis=None) -> SearchSpaceModel:
     norm_type  = genotype.norm_type
+    act_type   = genotype.act_type
     stem_c     = CHANNEL_LIST[genotype.stem_channels]
     dropout    = DROPOUT_LIST[genotype.head_dropout]
 
-    stem = build_stem(genotype.stem_type, C, stem_c, norm_type)
+    stem = build_stem(genotype.stem_type, C, stem_c, norm_type, act_type)
 
     stage_modules = []
     down_modules  = []
@@ -323,12 +326,12 @@ def build_model(genotype: Genotype, C: int, H: int, W: int,
 
     for stage_gene in genotype.active_stages:
         ds, stage_mod, c_out = _build_stage(
-            stage_gene, c_current, norm_type, aniso_axis)
+            stage_gene, c_current, norm_type, aniso_axis, act_type)
         down_modules.append(ds)        # None means stride inside block
         stage_modules.append(stage_mod)
         c_current = c_out
 
-    neck = build_neck(genotype.neck_type, c_current, norm_type)
+    neck = build_neck(genotype.neck_type, c_current, norm_type, act_type)
     if genotype.neck_type == 'global_avg':
         final_h, final_w = 1, 1
     else:

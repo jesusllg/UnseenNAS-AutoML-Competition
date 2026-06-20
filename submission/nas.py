@@ -88,10 +88,11 @@ _FALLBACK = {
 # ── Search helpers ────────────────────────────────────────────────────────────
 
 # Pipeline hyperparameters: single source of truth in config.py.
-from config import (NAS_POPULATION, NAS_ROUNDS, NAS_TOURNAMENT, SEARCH_FRAC)
+from config import (NAS_POPULATION, NAS_ROUNDS, NAS_TOURNAMENT, SEARCH_FRAC,
+                    NAS_PROXY_BATCH, LEARNING_RATE, WEIGHT_DECAY)
 
 
-def _get_proxy_batch(train_loader, device, batch_size=16):
+def _get_proxy_batch(train_loader, device, batch_size=NAS_PROXY_BATCH):
     """Grab a single small batch for zero-cost proxy evaluation."""
     try:
         x, _ = next(iter(train_loader))
@@ -282,7 +283,7 @@ class NAS:
         search_budget = self.clock.check() * budget_frac
         deadline = time.perf_counter() + search_budget
 
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(GLOBAL_SEED)
         best_model, best_acc = None, -1.0
         n_tried = 0
 
@@ -316,7 +317,7 @@ class NAS:
 
     def _proxy_train(self, model, n_epochs, max_batches):
         model.to(self.device).train()
-        opt  = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        opt  = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         crit = nn.CrossEntropyLoss()
         for _ in range(n_epochs):
             for i, (x, y) in enumerate(self.train_loader):

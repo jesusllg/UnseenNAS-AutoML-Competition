@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torchvision.transforms as transforms
 
+from config import GLOBAL_SEED
 from helpers import select_batch_size
 from search_space import infer_family
 
@@ -42,13 +43,12 @@ class DataProcessor:
         if x.ndim == 3:
             x = x[:, np.newaxis, :, :]
 
-        # Per-channel mean/std from training set
+        # Per-channel mean/std from training set. Kept local — we never write
+        # derived values back into the organisers' metadata dict (it belongs to
+        # them; our own knobs live in config.py).
         mean = x.mean(axis=(0, 2, 3))
         std = x.std(axis=(0, 2, 3))
         std = np.where(std < 1e-7, 1.0, std)
-
-        self.metadata['norm_mean'] = mean.tolist()
-        self.metadata['norm_std'] = std.tolist()
 
         h, w = x.shape[2], x.shape[3]
         n_cls = self.metadata.get('num_classes', 10)
@@ -77,7 +77,6 @@ class DataProcessor:
         # Smaller batches for large images to avoid OOM (shared rule so repair's
         # memory estimate is computed at the exact batch we train with).
         batch_size = select_batch_size(x.shape[1], h, w)
-        self.metadata['batch_size'] = batch_size
 
         train_ds = _Dataset(self.train_x, self.train_y, transform=train_transform)
         valid_ds = _Dataset(self.valid_x, self.valid_y, transform=eval_transform)
@@ -87,7 +86,7 @@ class DataProcessor:
 
         # Seeded generator so shuffle order is reproducible across runs
         g = torch.Generator()
-        g.manual_seed(42)
+        g.manual_seed(GLOBAL_SEED)
 
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=batch_size, shuffle=True, drop_last=True,

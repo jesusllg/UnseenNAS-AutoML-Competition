@@ -65,6 +65,7 @@ GLOBAL_FIELD_CARDINALITY: Dict[str, int] = {
     'head_type':     len(HEAD_TYPES),
     'head_dropout':  len(DROPOUT_LIST),
     'norm_type':     len(NORM_TYPES),
+    'act_type':      len(ACT_TYPES),
 }
 
 FIELD_CARDINALITY = {**GLOBAL_FIELD_CARDINALITY, **STAGE_FIELD_CARDINALITY}
@@ -105,6 +106,7 @@ class Genotype:
     head_type:     str              = 'GapLinear'
     head_dropout:  int              = 0          # index into DROPOUT_LIST
     norm_type:     str              = 'batch'
+    act_type:      str              = 'relu'     # network-wide activation
     stages:        List[StageGene] = field(default_factory=lambda: [StageGene() for _ in range(MAX_STAGES)])
 
     def __post_init__(self):
@@ -122,6 +124,7 @@ class Genotype:
             'head_type':     self.head_type,
             'head_dropout':  self.head_dropout,
             'norm_type':     self.norm_type,
+            'act_type':      self.act_type,
             'stages':        [s.to_dict() for s in self.stages],
         }
         return d
@@ -137,6 +140,7 @@ class Genotype:
             head_type     = d.get('head_type',     'GapLinear'),
             head_dropout  = d.get('head_dropout',  0),
             norm_type     = d.get('norm_type',     'batch'),
+            act_type      = d.get('act_type',      'relu'),
             stages        = stages,
         )
 
@@ -192,6 +196,7 @@ def sample_random_genotype(
         head_type     = random.choice(HEAD_TYPES),
         head_dropout  = random.randrange(len(DROPOUT_LIST)),
         norm_type     = random.choice(NORM_TYPES),
+        act_type      = random.choice(ACT_TYPES),
         stages        = stages,
     )
 
@@ -271,6 +276,8 @@ def mutate_large(g: Genotype) -> Genotype:
             g.head_dropout = random.randrange(len(DROPOUT_LIST))
         elif f == 'norm_type':
             g.norm_type = random.choice(NORM_TYPES)
+        elif f == 'act_type':
+            g.act_type = random.choice(ACT_TYPES)
     return g
 
 

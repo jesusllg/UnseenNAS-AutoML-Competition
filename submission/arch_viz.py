@@ -90,8 +90,9 @@ def save_arch(genotype, metadata: dict, save_path,
     })
 
     stem_ch = CHANNEL_LIST[genotype.stem_channels]
+    act = getattr(genotype, 'act_type', 'relu')
     nodes.append({
-        'label':    f'Stem  [{genotype.stem_type}]\n{stem_ch} ch  │  {genotype.norm_type}norm',
+        'label':    f'Stem  [{genotype.stem_type}]\n{stem_ch} ch  │  {genotype.norm_type}norm  │  {act}',
         'color':    '#B3CDE3',
         'ds_label': '',
     })

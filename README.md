@@ -418,185 +418,74 @@ This section documents every tunable parameter, where it lives, and what effect 
 
 ---
 
-### 8.1 Search budget allocation — `submission/nas.py`
+### 8.1 Configuration — `submission/config.py` (single source of truth)
 
-**Function**: `_search_params(benchmark)`
+Every tunable pipeline hyperparameter lives in **one file**: `submission/config.py`.
+NAS, the trainer, and the proxies all import their constants from it — nothing is
+read from the dataset `metadata` (that dict belongs to the organisers) and nothing
+is duplicated across modules. To tune the pipeline, edit `config.py` and nothing else.
 
-| Parameter | Location | Default | Effect |
-|---|---|---|---|
-| `search_frac` | `_search_params()` return | 0.20–0.35 | Fraction of remaining time allocated to NAS search. Higher → more search, less training. |
-| `n_pop` (n_population) | `_search_params()` return | 20–40 | Population size in Aging Evolution. Larger → more diverse exploration, slower per round. |
-| `n_rounds` | `_search_params()` return | 60–150 | Maximum evolution rounds. More → longer search, potentially better architecture. |
-| `tourney_k` (tournament_size) | `_search_params()` return | 5–10 | Tournament size. Larger → more selection pressure, faster convergence, less exploration. |
-
-Current schedule by `benchmark` metadata field:
-
-| Benchmark value | search_frac | n_pop | n_rounds | tourney_k |
-|---|---|---|---|---|
-| ≥ 85 (hard) | 0.35 | 40 | 150 | 10 |
-| 65–84 (medium) | 0.30 | 30 | 100 | 7 |
-| < 65 (easy) | 0.20 | 20 | 60 | 5 |
-| `None` | 0.30 | 30 | 100 | 7 |
-
-**To change**: Edit `_search_params()` in `submission/nas.py`, lines 95–105.
-
-```python
-def _search_params(benchmark):
-    if benchmark is None:
-        return 0.30, 30, 100, 7      # (search_frac, n_pop, n_rounds, tourney_k)
-    b = float(benchmark)
-    if b >= 85:
-        return 0.35, 40, 150, 10    # Increase 40→60 for richer search
-    elif b >= 65:
-        return 0.30, 30, 100, 7
-    else:
-        return 0.20, 20, 60, 5
-```
-
-**To override for a single run** without touching code, pass `benchmark` in metadata:
-```python
-metadata = {'benchmark': 95, ...}   # Forces hard-dataset search params
-```
-
----
-
-### 8.2 Aging Evolution — `submission/search_space/evolution.py`
-
-**Function**: `aging_evolution(family, C, H, W, num_classes, proxy_fn, batch_x, device, n_population, n_rounds, tournament_size, time_budget_s, verbose)`
-
-| Parameter | Type | Default | Effect |
-|---|---|---|---|
-| `n_population` | int | 50 | Size of the maintained population. Rule of thumb: ≥ 20 for stable results. |
-| `n_rounds` | int | 200 | Max number of child architectures evaluated. Each round = ~0.5–2s depending on model size. |
-| `tournament_size` | int | 10 | Candidates in each tournament. Higher = greedier selection. Try 3–20. |
-| `time_budget_s` | float | None | Hard wall-clock budget in seconds. Overrides `n_rounds` if reached first. |
-| `verbose` | bool | False | Print progress every 10 rounds if True. |
-
-Mutation scale thresholds (hardcoded in `evolution.py`, lines ~50-60):
-
-```python
-frac = round_idx / n_rounds
-if   frac < 0.30:  scale = 'large'    # Replace full stage
-elif frac < 0.70:  scale = 'medium'   # Multi-field changes
-else:              scale = 'small'    # 1-2 field changes
-```
-
-**To make search more explorative**: lower `tournament_size` (e.g. 3) and keep `n_population` high.  
-**To make search more exploitative**: raise `tournament_size` (e.g. 15) and shrink `n_population`.
-
----
-
-### 8.3 AZ-NAS proxy weights — `submission/search_space/proxies.py`
-
-**Function**: `az_nas_score(model, batch_x, device, lambda_c=0.1, reinit=True)`
-
-| Parameter | Type | Default | Effect |
-|---|---|---|---|
-| `lambda_c` | float | 0.1 | Weight on complexity penalty `log(params)`. Higher → smaller models preferred. |
-| `reinit` | bool | True | Whether to Kaiming-reinitialise weights before scoring. Always keep True. |
-
-**Component weights** (currently equal, summed directly):
-
-```python
-score = expressivity + progressivity + trainability - lambda_c * complexity
-```
-
-To change the relative weights, edit `az_nas_score()` in `proxies.py`:
-
-```python
-# Example: emphasise trainability for datasets where gradient flow matters
-score = 1.0 * expressivity + 0.5 * progressivity + 2.0 * trainability - 0.1 * complexity
-```
-
-**Proxy batch size** (in `nas.py::_get_proxy_batch`):
-
-```python
-def _get_proxy_batch(train_loader, device, batch_size=16):
-```
-
-Larger batches give more reliable proxy scores but consume more GPU memory. Try 8–64.
-
----
-
-### 8.4 Training — `submission/trainer.py`
-
-**Function**: `_train_params(benchmark)` and `Trainer._train()`
-
-| Parameter | Location | Default | Effect |
-|---|---|---|---|
-| `budget_frac` | `_train_params()` return | 0.83–0.87 | Fraction of remaining time used for training. |
-| `weight_decay` | `_train_params()` return | 5e-5 – 3e-4 | L2 regularisation. Higher → stronger regularisation (good for small datasets or many-class problems). |
-| `lr` | `_train()` line ~68 | 1e-3 | Initial learning rate for AdamW. |
-| `T_max` | `_train()` line ~69 | 200 | CosineAnnealingLR period (in epochs). Should be ≥ expected number of epochs. |
-| `eta_min` | `_train()` line ~69 | 1e-5 | Minimum learning rate at the end of cosine schedule. |
-| `label_smoothing` | `_train()` | 0.1 if n_cls≥10 | Label smoothing epsilon. Set to 0.0 to disable. |
-
-Training budget schedule:
-
-| Benchmark | budget_frac | weight_decay |
+| Constant | Default | Effect |
 |---|---|---|
-| ≥ 85 (hard) | 0.87 | 3e-4 |
-| 65–84 (medium) | 0.85 | 1e-4 |
-| < 65 (easy) | 0.83 | 5e-5 |
+| `GLOBAL_SEED` | 42 | Seed for all RNG (search, shuffling, weight init). |
+| `SEARCH_FRAC` | 0.30 | Fraction of the per-dataset budget spent on NAS search. |
+| `TRAIN_FRAC` | 0.65 | Fraction spent on final training (rest is predict/overhead). |
+| `NAS_POPULATION` | 100 | Aging-evolution population size. Larger → more diversity. |
+| `NAS_ROUNDS` | 2000 | Max evolution rounds (search stops at the time budget first). |
+| `NAS_TOURNAMENT` | 25 | Tournament size. Higher → greedier selection, less exploration. |
+| `NAS_PROXY_BATCH` | 16 | Samples in the batch fed to the zero-cost proxy. Try 8–64. |
+| `LAMBDA_COMPLEXITY` | 0.05 | Weight of the `log(params)` penalty in the AZ-NAS score. Higher → smaller models. |
+| `LEARNING_RATE` | 1e-3 | AdamW initial LR (proxy-train + final training). |
+| `WEIGHT_DECAY` | 1e-4 | AdamW weight decay. |
+| `GRAD_CLIP_NORM` | 1.0 | Global-norm gradient clipping. |
+| `LR_T_MAX` | 200 | Cosine-annealing half-period (epochs). |
+| `LR_ETA_MIN` | 1e-5 | Final LR floor of the cosine schedule. |
+| `LABEL_SMOOTHING` | 0.1 | Smoothing epsilon, applied when classes ≥ `LABEL_SMOOTHING_MIN_CLASSES`. |
+| `LABEL_SMOOTHING_MIN_CLASSES` | 10 | Below this class count, smoothing is disabled (0.0). |
+| `ES_ENABLED` | True | Master switch for early stopping. |
+| `ES_PATIENCE` | 20 | Consecutive regression epochs before stopping. |
+| `ES_PLATEAU_PATIENCE` | 20 | Consecutive plateau epochs before stopping. |
+| `ES_MIN_EPOCHS` | 10 | Warm-up before early stopping can trigger. |
+| `ES_DELTA_START` | 0.002 | Initial min-improvement threshold (0.2 pp). |
+| `ES_DELTA_MIN` | 0.001 | Floor for the improvement threshold after decay. |
+| `ES_DELTA_DECAY` | 3 | Improvements before the threshold halves. |
+| `ES_REGRESSION_DELTA` | 0.010 | Drop below best (1 pp) that counts as a regression epoch. |
 
-**To change the learning rate schedule**:
+The AZ-NAS score combined in `proxies.py` is:
 
 ```python
-# In trainer.py, _train():
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200, eta_min=1e-5)
-# Change T_max to match your expected epoch count, e.g.:
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+score = expressivity + progressivity + trainability - LAMBDA_COMPLEXITY * log(params)
 ```
 
-**To add warmup**:
-```python
-from torch.optim.lr_scheduler import LinearLR, SequentialLR
-warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=5)
-cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=195, eta_min=1e-5)
-scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
-```
+The competition facts (`N_COMPETITION_DATASETS=3`, `TOTAL_COMPETITION_HOURS=24`,
+`COMPETITION_OVERHEAD_HOURS=0.5`) also live in `config.py`; they are given by the
+organisers, not tuning knobs. Per-dataset time is then split by the halving policy
+in `helpers.GlobalBudgetGovernor` (DS1 = pool/2, DS2 = leftover/2, last = all left).
+
+> **Geometry, not config**: dataset-specific architecture choices (family,
+> anisotropy, pooling budget, horizontal-flip, attention enable) are **not** in
+> `config.py`. They are derived at runtime from `(C, H, W, n_classes)` by
+> `infer_family` (§8.4), because the real datasets are unseen.
 
 ---
 
-### 8.5 Data processing — `submission/data_processor.py`
+### 8.2 Repair constraints — `submission/search_space/repair.py`
 
-| Parameter | Location | Default | Effect |
-|---|---|---|---|
-| Batch size thresholds | `DataProcessor.process()` | pixels: 100k / 10k | Determines automatic batch size. Edit the `if` chain to override. |
-| Crop padding | `DataProcessor.process()` | `max(4, H//8)` | RandomCrop padding for images H≥32. Larger → more aggressive crop augmentation. |
-
-**To force a specific batch size**:
-```python
-# In data_processor.py, after the automatic selection:
-metadata['batch_size'] = 32   # Override automatic selection
-```
-
----
-
-### 8.6 Repair constraints — `submission/search_space/repair.py`
-
-**Function**: `repair(genotype, C, H, W, num_classes, family, memory_budget_mb=4096.0)`
+**Function**: `repair(genotype, C, H, W, num_classes, family, memory_budget_mb=None)`
 
 | Parameter | Type | Default | Effect |
 |---|---|---|---|
-| `memory_budget_mb` | float | 4096.0 | Maximum estimated activation memory (MB at batch=32). Architectures exceeding this have channels reduced. |
+| `memory_budget_mb` | float | `None` → ~80% of the **actual** GPU memory | Peak estimated training activation cap. Architectures exceeding it have expansion/channels/stages reduced (Rule R11). |
 
-To allow larger models (if you have a big GPU):
-```python
-# In nas.py, _search(), where aging_evolution is called:
-# Pass memory_budget_mb via repair kwargs — currently hardcoded in repair.py
-memory_budget_mb = 8192.0   # 8 GB
-```
-
-Edit `repair.py` Rule 11 directly:
-```python
-# Rule 11 — Memory budget guard
-MEMORY_BUDGET_MB = 8192.0   # Change this constant
-```
+The default tracks real hardware via `_default_memory_budget_mb()` (80% of
+`torch.cuda.get_device_properties(0).total_memory`, or 16 GB if no GPU is visible),
+so the cap scales with whatever GPU you run on — no constant to hand-edit. The
+estimate is computed at the same batch size the trainer uses
+(`helpers.select_batch_size`) so it can never silently under/over-count.
 
 ---
 
-### 8.7 Search space option lists — `submission/search_space/genotype.py`
+### 8.3 Search space option lists — `submission/search_space/genotype.py`
 
 These lists define the discrete vocabulary the search operates over. Edit them to restrict or expand the search space.
 
@@ -607,16 +496,19 @@ N_BLOCKS_LIST   = [1, 2, 3, 4]                                 # Blocks per stag
 EXPANSION_LIST  = [1, 2, 4, 6]                                 # MBConv expansion ratio
 DILATION_LIST   = [1, 2, 3, 4]                                 # Conv dilation
 SE_RATIO_LIST   = [0.0625, 0.125, 0.25]                       # Squeeze-Excitation ratio
-DROPOUT_LIST    = [0.0, 0.1, 0.2, 0.3]                        # Dropout rate
+DROPOUT_LIST    = [0.0, 0.1, 0.2, 0.3]                        # Head dropout rate
 DROP_PATH_LIST  = [0.0, 0.05, 0.1, 0.2]                       # DropPath (stochastic depth)
+GROUP_W_LIST    = [4, 8, 16, 32]                              # GroupedBottleneck group width
+ACT_TYPES       = ['relu', 'silu', 'gelu']                   # Network-wide activation
+NORM_TYPES      = ['batch', 'group']                          # Norm (family may force 'group')
 MAX_STAGES      = 5                                             # Maximum depth
 
 BLOCK_TYPES = [
     'ConvBlock', 'SepConvBlock', 'ResidualBlock', 'MBConvBlock',
     'BottleneckBlock', 'AnisotropicBlock', 'DilatedConvBlock',
     'GridLogicBlock', 'ChannelMixingBlock', 'GlobalContextBlock',
-    'LightAttentionBlock',
-]   # 11 blocks
+    'LightAttentionBlock', 'GroupedBottleneckBlock',
+]   # 12 blocks
 
 HEAD_TYPES = [
     'GapLinear', 'GmpLinear', 'GapGmpLinear',
@@ -626,6 +518,11 @@ HEAD_TYPES = [
 STEM_TYPES = ['conv3x3', 'conv7x7', 'conv1x1', 'double_conv']   # 4 stem types
 NECK_TYPES = ['none', 'conv1x1', 'global_avg']                   # 3 neck types
 ```
+
+`act_type` and `norm_type` are **global** genes (one activation / one norm for the
+whole network); everything else is per-stage. Both are searched (`silu`/`gelu` are
+real options, not dead code) and threaded through stem, stages, and neck by the
+builder.
 
 **To restrict search to fewer channels** (faster, smaller models):
 ```python
@@ -643,28 +540,32 @@ BLOCK_TYPES = [
 
 ---
 
-### 8.8 Family geometry constraints — `submission/search_space/family.py`
+### 8.4 Family geometry constraints — `submission/search_space/family.py`
 
 **Function**: `infer_family(C, H, W, num_classes) → FamilyProfile`
 
-The family thresholds that trigger each constraint:
+Families are inferred **purely from geometry** `(C, H, W, n_classes)` — never from
+dataset identity — so the rules generalise to unseen data. Evaluated top-to-bottom;
+first match wins:
 
-| Family | Trigger condition | Max pool steps | Force GroupNorm |
-|---|---|---|---|
-| `anisotropic` | max(H,W)/min(H,W) ≥ 6 | 2 | Yes |
-| `small_grid` | max(H,W) ≤ 10 | 1 | Yes |
-| `possible_voxel` | H≈W≈C (cube-like, area≤1024) | 2 | Yes |
-| `channel_heavy` | C ≥ 8, area ≤ 1024 | 2 | Yes |
-| `spatiotemporal_like` | C≥3, H=1 or W=1 | 3 | Yes |
-| `visual_large` | min(H,W) ≥ 64 | 5 | No |
-| `visual_medium` | min(H,W) ≥ 24 | 3 | No |
-| `compact_general` | everything else | 2 | No |
+| Family | Trigger condition | Max pool steps | Force GroupNorm | Notes |
+|---|---|---|---|---|
+| `anisotropic` | ratio ≥ 6 **and** min(H,W) ≤ 8 | `min(2, log2(min))` | Yes | attention off; hflip off (axis is sequential) |
+| `small_grid` | max(H,W) ≤ 10 | 1 | Yes | board/symbolic grids |
+| `possible_voxel` | H≈W≈C cube, area ≤ 625 | 2 | Yes | attention only if area ≤ 256 |
+| `channel_heavy` | C ≥ 8, area ≤ 1024 | 2 | if C%8==0 | attention only if area ≤ 256 |
+| `spatiotemporal_like` | C ≥ 3, H=1 or W=1, max ≥ 32 | 3 | No | aniso axis set |
+| `visual_large` | min(H,W) ≥ 64 | 4 if min<128 else 5 | No | per-stage attention guard |
+| `visual_medium` | min(H,W) ≥ 24 | 3 | No | |
+| `compact_general` | everything else | 2 | No | attention only if area ≤ 256 |
 
-To adjust thresholds, edit `infer_family()` in `family.py`.
+`augment_hflip` is a family field consumed by `DataProcessor`; only `anisotropic`
+disables it (flipping a sequential axis destroys positional meaning). To adjust any
+threshold, edit `infer_family()` in `family.py`.
 
 ---
 
-### 8.9 Evaluation time limit
+### 8.5 Evaluation time limit
 
 The `time_limit` field in dataset metadata controls the total wall-clock seconds given to the full pipeline (DataProcessor + NAS + Trainer):
 
@@ -679,7 +580,8 @@ python evaluation/main.py --time_limit 120    # 2 minutes (very short training)
 python evaluation/main.py --time_limit 3600   # 1 hour
 ```
 
-The NAS module consumes `search_frac × time_limit` seconds. Trainer consumes `budget_frac × remaining` seconds.
+NAS consumes `SEARCH_FRAC` of the per-dataset allocation; the trainer gets the
+remainder of that dataset's budget (via `GlobalBudgetGovernor.effective_remaining()`).
 
 ---
 
@@ -688,21 +590,20 @@ The NAS module consumes `search_frac × time_limit` seconds. Trainer consumes `b
 ### Scenario A: Quick debug run (< 5 minutes)
 
 ```python
-# In nas.py _search_params(), override everything:
-def _search_params(benchmark):
-    return 0.20, 10, 20, 3   # tiny search
+# In config.py — shrink the search:
+NAS_POPULATION  = 10
+NAS_ROUNDS      = 20
+NAS_TOURNAMENT  = 3
+NAS_PROXY_BATCH = 8
 
-# In genotype.py:
-CHANNEL_LIST = [16, 32, 64]
+# In genotype.py — shrink the vocabulary:
+CHANNEL_LIST  = [16, 32, 64]
 N_BLOCKS_LIST = [1, 2]
-
-# In proxies.py:
-def _get_proxy_batch(..., batch_size=8): ...   # smaller proxy batch
 ```
 
 Run with:
 ```bash
-python evaluation/main.py --time_limit 300
+python run.py --time 0.08      # ~5 min per dataset
 ```
 
 ---
@@ -710,32 +611,30 @@ python evaluation/main.py --time_limit 300
 ### Scenario B: Large GPU, serious search (A100 / H100)
 
 ```python
-# In nas.py _search_params():
-def _search_params(benchmark):
-    return 0.45, 100, 500, 15   # large population, many rounds
-
-# In repair.py:
-MEMORY_BUDGET_MB = 32768.0   # 32 GB budget
-
-# In proxies.py _get_proxy_batch():
-batch_size = 64   # larger proxy batches
-
-# In trainer.py _train_params():
-def _train_params(benchmark):
-    return 0.90, 1e-4   # spend 90% of time training
+# In config.py — bigger, greedier search and more training:
+NAS_POPULATION  = 200
+NAS_ROUNDS      = 5000
+NAS_TOURNAMENT  = 25
+NAS_PROXY_BATCH = 64
+SEARCH_FRAC     = 0.40
+TRAIN_FRAC      = 0.55
 ```
+
+The memory budget needs no change — `repair.py` auto-targets ~80% of the actual
+GPU, so a bigger card automatically allows bigger models.
 
 ---
 
 ### Scenario C: CPU-only / small machine
 
 ```python
-# In nas.py _search_params():
-def _search_params(benchmark):
-    return 0.10, 5, 10, 3   # minimal search
+# In config.py — minimal search:
+NAS_POPULATION  = 5
+NAS_ROUNDS      = 10
+NAS_TOURNAMENT  = 3
 
 # In genotype.py — remove heavy blocks:
-BLOCK_TYPES = ['ConvBlock', 'SepConvBlock', 'ResidualBlock', 'MBConvBlock']
+BLOCK_TYPES  = ['ConvBlock', 'SepConvBlock', 'ResidualBlock', 'MBConvBlock']
 CHANNEL_LIST = [16, 32, 48, 64]
 ```
 

@@ -2,10 +2,9 @@ import math
 from typing import Optional
 
 from .genotype import (
-    Genotype, StageGene, sample_random_genotype,
+    Genotype,
     CHANNEL_LIST, KERNEL_LIST, N_BLOCKS_LIST, EXPANSION_LIST,
-    DILATION_LIST, DROP_PATH_LIST, HEAD_TYPES, DOWNSAMPLE_OPS,
-    MAX_STAGES, GROUP_W_LIST,
+    DILATION_LIST, MAX_STAGES,
 )
 from .family import FamilyProfile
 
@@ -14,7 +13,6 @@ from .family import FamilyProfile
 
 def estimate_params(genotype: Genotype, C: int, H: int, W: int,
                     num_classes: int) -> int:
-    from .genotype import CHANNEL_LIST, KERNEL_LIST, N_BLOCKS_LIST, EXPANSION_LIST
     p = 0
     stem_c = CHANNEL_LIST[genotype.stem_channels]
     # stem: 3×3 conv
@@ -78,7 +76,6 @@ def estimate_activations_mb(genotype: Genotype, C: int, H: int, W: int,
         and ChannelMixing expand channels; see _block_mid_channels)
       - Training factor ×3 for backward gradients + Adam m/v states
     """
-    from .genotype import CHANNEL_LIST, EXPANSION_LIST, N_BLOCKS_LIST
     h, w = H, W
     total_elements = 0
     c_in = CHANNEL_LIST[genotype.stem_channels]

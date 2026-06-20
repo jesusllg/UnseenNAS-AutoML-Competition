@@ -51,6 +51,11 @@ NAS_ROUNDS     = 2000   # effectively "run until the time budget expires"
 # proxy-gaming, over-shrunk architectures. Lower it if that reappears.
 NAS_TOURNAMENT = 25
 
+# Number of samples in the single batch fed to the zero-cost proxy. Small by
+# design: the proxies score a forward/backward on one batch, so this trades
+# proxy-estimate variance against per-candidate cost.
+NAS_PROXY_BATCH = 16
+
 
 # ── Zero-cost proxy (AZ-NAS) ──────────────────────────────────────────────────
 # Weight of the complexity penalty -lambda_c*log(params) in the combined score.
@@ -62,9 +67,22 @@ NAS_TOURNAMENT = 25
 LAMBDA_COMPLEXITY = 0.05
 
 
-# ── Final training ────────────────────────────────────────────────────────────
+# ── Final training (optimizer + schedule) ─────────────────────────────────────
 
-WEIGHT_DECAY = 1e-4
+LEARNING_RATE = 1e-3    # AdamW initial learning rate
+WEIGHT_DECAY  = 1e-4    # AdamW weight decay
+GRAD_CLIP_NORM = 1.0    # global-norm gradient clipping
+
+# Cosine annealing schedule. T_MAX is the cosine half-period in epochs; it is
+# intentionally larger than most runs reach so the LR decays smoothly rather
+# than completing a full cosine cycle (early stopping / time budget end first).
+LR_T_MAX   = 200
+LR_ETA_MIN = 1e-5
+
+# Label smoothing is applied only when the task has enough classes for it to
+# help (it hurts very-few-class problems by capping confidence too aggressively).
+LABEL_SMOOTHING              = 0.1
+LABEL_SMOOTHING_MIN_CLASSES  = 10
 
 
 # ── Early stopping (regression-based with dynamic improvement delta) ──────────

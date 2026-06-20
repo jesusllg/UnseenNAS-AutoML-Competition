@@ -23,6 +23,11 @@ from .family import FamilyProfile
 from .repair import repair
 from .builder import build_model
 
+try:
+    from config import GLOBAL_SEED as _DEFAULT_SEED
+except ImportError:
+    _DEFAULT_SEED = 42   # standalone import without submission/ on sys.path
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,7 +56,7 @@ def aging_evolution(
     n_rounds:        int  = 200,
     tournament_size: int  = 10,
     time_budget_s:   Optional[float] = None,
-    seed:            int  = 42,
+    seed:            int  = _DEFAULT_SEED,
     verbose:         bool = False,
 ) -> List[Individual]:
     """

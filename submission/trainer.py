@@ -16,6 +16,8 @@ from helpers import show_time, set_seeds, GLOBAL_SEED, free_gpu
 # Pipeline hyperparameters: single source of truth in config.py.
 from config import (
     SEARCH_FRAC, TRAIN_FRAC, WEIGHT_DECAY,
+    LEARNING_RATE, GRAD_CLIP_NORM, LR_T_MAX, LR_ETA_MIN,
+    LABEL_SMOOTHING, LABEL_SMOOTHING_MIN_CLASSES,
     ES_ENABLED, ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
     ES_DELTA_START, ES_DELTA_MIN, ES_DELTA_DECAY, ES_REGRESSION_DELTA,
 )
@@ -113,11 +115,10 @@ class Trainer:
         free_gpu()
         self.model.to(self.device)
 
-        # Complementary fractions of the TOTAL clock budget:
-        #   search_frac takes X% of total at NAS time
-        #   train_frac  is also a fraction of total — we recover it from remaining time
         weight_decay = WEIGHT_DECAY
 
+        # Training budget. SEARCH_FRAC / TRAIN_FRAC are complementary fractions of
+        # the TOTAL per-dataset clock; the GBG already knows how much NAS consumed.
         gbg = self.metadata.get('_gbg')
         if gbg is not None:
             # GBG is active: training gets everything left of the allocated budget.
@@ -135,21 +136,18 @@ class Trainer:
         stopper = _EarlyStopper(ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
                                 ES_DELTA_START, ES_DELTA_MIN,
                                 ES_DELTA_DECAY, ES_REGRESSION_DELTA, ES_ENABLED)
-        stopper = _EarlyStopper(es_patience, es_plateau_patience, es_min_epochs,
-                                es_delta_start, es_delta_min,
-                                es_delta_decay, es_regression_delta, es_enabled)
 
         n_cls = self.metadata['num_classes']
-        label_smoothing = 0.1 if n_cls >= 10 else 0.0
+        label_smoothing = LABEL_SMOOTHING if n_cls >= LABEL_SMOOTHING_MIN_CLASSES else 0.0
 
-        es_desc = (f"δ↑{es_delta_start:.4f}↘{es_delta_min:.4f}/{es_delta_decay} "
-                   f"↓{es_regression_delta:.4f} p={es_patience}/~{es_plateau_patience}") if es_enabled else "off"
+        es_desc = (f"δ↑{ES_DELTA_START:.4f}↘{ES_DELTA_MIN:.4f}/{ES_DELTA_DECAY} "
+                   f"↓{ES_REGRESSION_DELTA:.4f} p={ES_PATIENCE}/~{ES_PLATEAU_PATIENCE}") if ES_ENABLED else "off"
         print(f"  Trainer | budget={show_time(train_budget)} wd={weight_decay:.0e}"
               f" | ES={es_desc} | device={self.device}")
 
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=weight_decay)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200, eta_min=1e-5)
+        optimizer = optim.AdamW(self.model.parameters(), lr=LEARNING_RATE, weight_decay=weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=LR_ETA_MIN)
 
         use_amp = torch.cuda.is_available()
         scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -205,15 +203,15 @@ class Trainer:
                 best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
 
             stop, zone = stopper.step(val_acc, epoch)
-            wait_str = f" ↓{stopper.wait}/{es_patience}" if zone == '↓' else ""
+            wait_str = f" ↓{stopper.wait}/{ES_PATIENCE}" if zone == '↓' else ""
             print("  Epoch {:>3} | Train {:>6.2f}% | Val {:>6.2f}% | {} | lr {:.2e} {}{}".format(
                 epoch, train_acc * 100, val_acc * 100,
                 show_time(epoch_times[-1]), lr_now, zone, wait_str))
 
             if stop:
                 saved = show_time(max(0.0, deadline - time.perf_counter()))
-                reason = (f"plateau ~×{es_plateau_patience}" if zone == '~'
-                          else f"regression ↓>{es_regression_delta*100:.1f}pp ×{es_patience}")
+                reason = (f"plateau ~×{ES_PLATEAU_PATIENCE}" if zone == '~'
+                          else f"regression ↓>{ES_REGRESSION_DELTA*100:.1f}pp ×{ES_PATIENCE}")
                 print(f"  Early stop at epoch {epoch} ({reason}). ~{saved} returned to pool.")
                 break
 
@@ -268,7 +266,7 @@ class Trainer:
                     scaler.scale(loss).backward()
                     outs.append(out.detach())
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP_NORM)
                 scaler.step(optimizer)
                 scaler.update()
                 return torch.cat(outs, dim=0)
