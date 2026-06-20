@@ -171,11 +171,23 @@ def complexity_penalty(model: nn.Module) -> float:
 
 # ── Combined AZ-NAS score ─────────────────────────────────────────────────────
 
+# Weight of the complexity penalty -lambda_c*log(params) in the combined score.
+# Deliberately small: it should be a tie-breaker toward lighter/faster models
+# (we are time- and hardware-limited), NOT a dominant pressure that shrinks
+# architectures past the point where they can fit the task. Empirically, 0.1
+# over-shrank — with long searches the constant, floor-less downward pull let
+# the search trade real capacity for marginal proxy gains. 0.05 keeps the
+# light-model bias while leaving capacity on the table for hard datasets. The
+# hard memory ceiling (repair R11, ~80% of GPU) is what actually bounds size;
+# this term only orders the *feasible* candidates.
+_LAMBDA_COMPLEXITY = 0.05
+
+
 def az_nas_score(
     model:    nn.Module,
     batch_x:  torch.Tensor,
     device,
-    lambda_c: float = 0.1,
+    lambda_c: float = _LAMBDA_COMPLEXITY,
     reinit:   bool  = True,
 ) -> float:
     """
@@ -217,7 +229,7 @@ def az_nas_score_full(
     model:    nn.Module,
     batch_x:  torch.Tensor,
     device,
-    lambda_c: float = 0.1,
+    lambda_c: float = _LAMBDA_COMPLEXITY,
     reinit:   bool  = True,
 ) -> dict:
     """Same as az_nas_score but returns each component."""

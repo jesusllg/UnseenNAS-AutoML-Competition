@@ -89,7 +89,12 @@ _FALLBACK = {
 
 _N_POPULATION    = 100
 _N_ROUNDS        = 2000   # effectively "run until time budget expires"
-_TOURNAMENT_SIZE = 25
+# Selection intensity = tournament / population. Real et al. used 25/100 with a
+# TRUE-accuracy fitness; our zero-cost proxy is far noisier, so the same high
+# pressure over a long search exploits proxy noise (it gates on the proxy's
+# mistakes) and over-converges to proxy-gaming, over-shrunk architectures.
+# 10/100 keeps more diversity / exploration and is more robust to that noise.
+_TOURNAMENT_SIZE = 10
 _SEARCH_FRAC     = 0.30
 
 
