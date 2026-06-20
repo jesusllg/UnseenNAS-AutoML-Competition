@@ -216,9 +216,15 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
             stage.dilation_idx = max(0, stage.dilation_idx - 1)
             d = DILATION_LIST[stage.dilation_idx]
 
-        # (e) LightAttentionBlock needs spatial > 1 in each dim to run attn
-        if stage.block_type == 'LightAttentionBlock' and min(sh, sw) <= 1:
-            stage.block_type = 'ConvBlock'
+        # (e) LightAttentionBlock: per-stage spatial guard.
+        #   Too-large (sh*sw > 256): O(N²) attention is prohibitive — this fires
+        #   for early stages of visual_large (e.g. 64×64=4096) while letting deep
+        #   stages through once spatial shrinks (e.g. 8×8=64 passes freely).
+        #   Too-small (min dim ≤ 1): collapses to identity; replace.
+        _ATTN_SPATIAL_LIMIT = 256
+        if stage.block_type == 'LightAttentionBlock':
+            if sh * sw > _ATTN_SPATIAL_LIMIT or min(sh, sw) <= 1:
+                stage.block_type = 'ConvBlock'
 
         # (f) anisotropic axis: AnisotropicBlock already uses (1,stride) — fine
         # no action needed for aniso
