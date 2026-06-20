@@ -94,7 +94,7 @@ _N_ROUNDS        = 2000   # effectively "run until time budget expires"
 # pressure over a long search exploits proxy noise (it gates on the proxy's
 # mistakes) and over-converges to proxy-gaming, over-shrunk architectures.
 # 10/100 keeps more diversity / exploration and is more robust to that noise.
-_TOURNAMENT_SIZE = 10
+_TOURNAMENT_SIZE = 25
 _SEARCH_FRAC     = 0.30
 
 
@@ -153,10 +153,10 @@ class NAS:
         H, W  = shape[2], shape[3]
         n_cls = self.metadata['num_classes']
 
-        n_pop     = self.metadata.get('n_population',    _N_POPULATION)
-        n_rounds  = self.metadata.get('n_rounds',        _N_ROUNDS)
-        tourney_k = self.metadata.get('tournament_size', _TOURNAMENT_SIZE)
-        search_frac   = self.metadata.get('search_frac', _SEARCH_FRAC)
+        n_pop       = _N_POPULATION
+        n_rounds    = _N_ROUNDS
+        tourney_k   = _TOURNAMENT_SIZE
+        search_frac = _SEARCH_FRAC
         # Cap search to our effective per-dataset budget, not just clock remaining
         search_budget = min(self.clock.check(), self._gbg.current_allocation()) * search_frac
         t_search_start = time.perf_counter()
