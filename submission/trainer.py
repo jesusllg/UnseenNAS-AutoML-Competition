@@ -117,7 +117,7 @@ class Trainer:
                 gbg.finish_dataset()
 
     def _train(self):
-        set_seeds(self.metadata.get('seed', GLOBAL_SEED))
+        set_seeds(GLOBAL_SEED)
         # Start training with the NAS search phase's idle GPU memory reclaimed.
         free_gpu()
         self.model.to(self.device)
@@ -125,9 +125,7 @@ class Trainer:
         # Complementary fractions of the TOTAL clock budget:
         #   search_frac takes X% of total at NAS time
         #   train_frac  is also a fraction of total — we recover it from remaining time
-        search_frac  = self.metadata.get('search_frac',  _SEARCH_FRAC)
-        train_frac   = self.metadata.get('train_frac',   _TRAIN_FRAC)
-        weight_decay = self.metadata.get('weight_decay', _WEIGHT_DECAY)
+        weight_decay = _WEIGHT_DECAY
 
         gbg = self.metadata.get('_gbg')
         if gbg is not None:
@@ -137,20 +135,15 @@ class Trainer:
             train_budget = min(self.clock.check(), gbg.effective_remaining())
         else:
             # Legacy fallback when GBG is not available: estimate from fractions.
-            remaining_frac = max(1.0 - search_frac, 1e-6)
-            train_budget   = self.clock.check() * (train_frac / remaining_frac)
+            remaining_frac = max(1.0 - _SEARCH_FRAC, 1e-6)
+            train_budget   = self.clock.check() * (_TRAIN_FRAC / remaining_frac)
         deadline = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 
         # Early stopping (regression-based with dynamic improvement delta)
-        es_enabled          = self.metadata.get('es_enabled',           _ES_ENABLED)
-        es_patience         = self.metadata.get('es_patience',          _ES_PATIENCE)
-        es_plateau_patience = self.metadata.get('es_plateau_patience',  _ES_PLATEAU_PATIENCE)
-        es_min_epochs       = self.metadata.get('es_min_epochs',        _ES_MIN_EPOCHS)
-        es_delta_start      = self.metadata.get('es_delta_start',       _ES_DELTA_START)
-        es_delta_min        = self.metadata.get('es_delta_min',         _ES_DELTA_MIN)
-        es_delta_decay      = self.metadata.get('es_delta_decay',       _ES_DELTA_DECAY)
-        es_regression_delta = self.metadata.get('es_regression_delta',  _ES_REGRESSION_DELTA)
+        stopper = _EarlyStopper(_ES_PATIENCE, _ES_PLATEAU_PATIENCE, _ES_MIN_EPOCHS,
+                                _ES_DELTA_START, _ES_DELTA_MIN,
+                                _ES_DELTA_DECAY, _ES_REGRESSION_DELTA, _ES_ENABLED)
         stopper = _EarlyStopper(es_patience, es_plateau_patience, es_min_epochs,
                                 es_delta_start, es_delta_min,
                                 es_delta_decay, es_regression_delta, es_enabled)

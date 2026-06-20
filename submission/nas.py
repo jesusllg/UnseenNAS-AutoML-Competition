@@ -145,7 +145,7 @@ class NAS:
             return SearchableCNN(in_c, n_cls, _FALLBACK['medium'], hw)
 
     def _search(self):
-        seed = self.metadata.get('seed', GLOBAL_SEED)
+        seed = GLOBAL_SEED
         set_seeds(seed)
 
         shape = self.metadata['input_shape']

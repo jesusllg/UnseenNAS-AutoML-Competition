@@ -115,37 +115,9 @@ def run_one(dataset_path: Path, args, pred_dir: Path, hours: float):
     clock    = Clock(hours)
     imut     = copy.deepcopy(clock)
 
-    # Inject all tunable pipeline params so NAS/Trainer read them from metadata
-    meta['seed']             = args.seed
-    meta['search_frac']      = args.search_frac
-    meta['n_population']     = args.nas_population
-    meta['n_rounds']         = args.nas_rounds
-    meta['tournament_size']  = args.nas_tournament
-    meta['proxy_epochs']     = args.proxy_epochs
-    meta['proxy_batches']    = args.proxy_batches
-    meta['train_frac']       = args.train_frac
-    meta['weight_decay']     = args.weight_decay
-    meta['es_enabled']       = args.es_enabled
-    meta['es_patience']      = args.es_patience
-    meta['es_min_epochs']    = args.es_min_epochs
-    meta['es_delta_start']      = args.es_delta_start
-    meta['es_delta_min']        = args.es_delta_min
-    meta['es_delta_decay']      = args.es_delta_decay
-    meta['es_plateau_patience'] = args.es_plateau_patience
-    meta['es_regression_delta'] = args.es_regression_delta
-
-    es_str = (f"↑δ{args.es_delta_start:.4f}↘{args.es_delta_min:.4f} "
-              f"↓{args.es_regression_delta:.4f} p={args.es_patience}") if args.es_enabled else "off"
     print(f"\n{'='*10} {codename:^20} {'='*10}")
-    print(f"  time={hours}h | truncate={args.truncate}"
-          f" | search={args.search_frac} train={args.train_frac} wd={args.weight_decay:.0e}"
-          f" | NAS pop={args.nas_population} rounds={args.nas_rounds} k={args.nas_tournament}"
-          f" | ES={es_str}")
-    _injected = {'seed','search_frac','n_population','n_rounds','tournament_size',
-                 'proxy_epochs','proxy_batches','train_frac','weight_decay',
-                 'es_enabled','es_patience','es_plateau_patience','es_min_epochs',
-                 'es_delta_start','es_delta_min','es_delta_decay','es_regression_delta'}
-    [print(f"  {k}: {v}") for k, v in meta.items() if k not in _injected]
+    print(f"  time={hours}h | truncate={args.truncate}")
+    [print(f"  {k}: {v}") for k, v in meta.items()]
 
     t0 = time.perf_counter()
     try:
@@ -224,53 +196,12 @@ def main():
                          "Mutually exclusive with --time.")
     ap.add_argument("--min-time", type=float, default=0.1, metavar="HOURS",
                     help="Floor time per dataset when using --total-time. (default: 0.1h)")
-    ap.add_argument("--seed", type=int, default=42,
-                    help="Global random seed for NAS search and training. (default: 42)")
     ap.add_argument("--truncate", action="store_true",
                     help="Use only 64 samples per split (quick smoke-test).")
     ap.add_argument("--datasets-dir", default="datasets", metavar="DIR",
                     help="Root folder containing dataset subdirectories.")
-    # ── Pipeline hyperparameters ──────────────────────────────────────────────
-    # search_frac + train_frac should sum to ≤ 0.95 (5% buffer for predict/overhead)
-    ap.add_argument("--search-frac",      type=float, default=0.30,
-                    help="Fraction of total budget for NAS search. (default: 0.30)")
-    ap.add_argument("--train-frac",       type=float, default=0.65,
-                    help="Fraction of total budget for final training. (default: 0.65)")
-    ap.add_argument("--nas-population",   type=int,   default=100,
-                    help="NAS population size. (default: 100)")
-    ap.add_argument("--nas-rounds",       type=int,   default=2000,
-                    help="Max NAS evolution rounds (stops at time budget). (default: 2000)")
-    ap.add_argument("--nas-tournament",   type=int,   default=25,
-                    help="NAS tournament size. (default: 25)")
-    ap.add_argument("--proxy-epochs",     type=int,   default=3,
-                    help="Training epochs per candidate during proxy eval. (default: 3)")
-    ap.add_argument("--proxy-batches",    type=int,   default=40,
-                    help="Max batches per epoch during proxy eval. (default: 40)")
-    ap.add_argument("--weight-decay",     type=float, default=1e-4,
-                    help="AdamW weight decay for final training. (default: 1e-4)")
-    # ── Early stopping (dynamic delta) ───────────────────────────────────────
-    ap.add_argument("--no-es", dest="es_enabled", action="store_false", default=True,
-                    help="Disable early stopping entirely.")
-    ap.add_argument("--es-patience",     type=int,   default=20,
-                    help="Consecutive non-improving epochs before stopping. (default: 20)")
-    ap.add_argument("--es-min-epochs",   type=int,   default=10,
-                    help="Minimum epochs before ES can trigger. (default: 10)")
-    ap.add_argument("--es-delta-start",  type=float, default=0.002,
-                    help="Initial min-improvement threshold. (default: 0.002 = 0.2pp)")
-    ap.add_argument("--es-delta-min",    type=float, default=0.001,
-                    help="Floor for delta after decay. (default: 0.001 = 0.1pp)")
-    ap.add_argument("--es-delta-decay",       type=int,   default=3,
-                    help="Improvements before halving delta. (default: 3)")
-    ap.add_argument("--es-plateau-patience", type=int,   default=20,
-                    help="Consecutive plateau epochs before stopping. (default: 20)")
-    ap.add_argument("--es-regression-delta", type=float, default=0.010,
-                    help="Fall >X below best to count as bad epoch. (default: 0.010 = 1pp)")
     args = ap.parse_args()
 
-    # Validate fractions
-    if args.search_frac + args.train_frac > 0.95:
-        print(f"WARNING: search_frac ({args.search_frac}) + train_frac ({args.train_frac})"
-              f" = {args.search_frac + args.train_frac:.2f} > 0.95 — little time left for predict/overhead.")
     if args.time is not None and args.total_time is not None:
         print("ERROR: --time and --total-time are mutually exclusive.")
         sys.exit(1)
