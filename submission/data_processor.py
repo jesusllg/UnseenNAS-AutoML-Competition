@@ -2,6 +2,9 @@ import numpy as np
 import torch
 import torchvision.transforms as transforms
 
+from helpers import select_batch_size
+from search_space import infer_family
+
 
 class _Dataset(torch.utils.data.Dataset):
     def __init__(self, x, y, transform=None):
@@ -48,33 +51,32 @@ class DataProcessor:
         self.metadata['norm_std'] = std.tolist()
 
         h, w = x.shape[2], x.shape[3]
+        n_cls = self.metadata.get('num_classes', 10)
 
         normalize = transforms.Normalize(mean=mean.tolist(), std=std.tolist())
 
+        # Whether to apply RandomHorizontalFlip depends on the geometry family.
+        # Anisotropic data (extreme aspect ratio ≥6×) likely has sequential structure
+        # along the long axis; flipping that axis may invalidate positional semantics.
+        # All other families default to flipping on.
+        family = infer_family(x.shape[1], h, w, n_cls)
+        use_hflip = getattr(family, 'augment_hflip', True)
+        flip = [transforms.RandomHorizontalFlip()] if use_hflip else []
+
         if h >= 32:
             pad = max(4, h // 8)
-            train_transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(),
+            train_transform = transforms.Compose(flip + [
                 transforms.RandomCrop(h, padding=pad),
                 normalize,
             ])
         else:
-            train_transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(),
-                normalize,
-            ])
+            train_transform = transforms.Compose(flip + [normalize])
 
         eval_transform = transforms.Compose([normalize])
 
-        # Smaller batches for large images to avoid OOM
-        pixels = h * w * x.shape[1]
-        if pixels > 100_000:
-            batch_size = 16
-        elif pixels > 10_000:
-            batch_size = 32
-        else:
-            batch_size = 64
-
+        # Smaller batches for large images to avoid OOM (shared rule so repair's
+        # memory estimate is computed at the exact batch we train with).
+        batch_size = select_batch_size(x.shape[1], h, w)
         self.metadata['batch_size'] = batch_size
 
         train_ds = _Dataset(self.train_x, self.train_y, transform=train_transform)

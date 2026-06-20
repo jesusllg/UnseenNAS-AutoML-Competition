@@ -1,6 +1,7 @@
 import json
 import math
 import random as _random
+import re
 import time
 from pathlib import Path
 
@@ -43,6 +44,41 @@ def div_remainder(n, interval):
     return factor, remainder
 
 
+# ── Hardware/runtime helpers (single source of truth) ────────────────────────
+
+def select_batch_size(C: int, H: int, W: int) -> int:
+    """
+    THE batch-size rule, keyed on input pixel count (channels × H × W).
+
+    One definition used by both sides so they can never disagree:
+      • DataProcessor builds the loaders with it.
+      • repair.py estimates training memory with it, so the estimate matches
+        the batch the trainer will actually run (a mismatch here silently
+        under/over-estimates memory and lets oversized models OOM the trainer).
+    """
+    pixels = C * H * W
+    if pixels > 100_000:
+        return 16
+    if pixels > 10_000:
+        return 32
+    return 64
+
+
+def free_gpu() -> None:
+    """
+    THE GPU-memory reclaim idiom: drop unreferenced Python tensors, then return
+    the CUDA caching allocator's unused blocks to the driver.
+
+    Call at phase boundaries (entering NAS, handing a model from search to
+    training, after an OOM) so the next phase starts without the previous
+    phase's reserved-but-idle memory inflating the allocator's footprint.
+    """
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def show_time(seconds):
     if seconds < 60:
         return "{:.2f}s".format(seconds)
@@ -54,6 +90,36 @@ def show_time(seconds):
         minutes, seconds = div_remainder(seconds, 60)
         return "{}h,{}m,{}s".format(hours, minutes, seconds)
 
+
+# ── Metadata loading (single shared implementation) ──────────────────────────
+
+def sanitize_metadata_json(raw: str) -> str:
+    """
+    Coerce non-standard bare values in metadata JSON to valid JSON equivalents.
+    Handles: ? NA N/A NaN nan Inf -Inf Infinity None undefined True False.
+    Quoted string values like "benchmark": "NA" are left untouched.
+    """
+    _NULL_TOKENS = (
+        r'\?'
+        r'|N/A|NA'
+        r'|NaN|nan'
+        r'|[+-]?[Ii]nfinity|[+-]?[Ii]nf'
+        r'|None'
+        r'|undefined'
+    )
+    raw = re.sub(r':\s*(?:' + _NULL_TOKENS + r')(?=\s*[,}\]\r\n])', ': null', raw)
+    raw = re.sub(r':\s*True(?=\s*[,}\]\r\n])',  ': true',  raw)
+    raw = re.sub(r':\s*False(?=\s*[,}\]\r\n])', ': false', raw)
+    return raw
+
+
+def load_metadata(dataset_path) -> dict:
+    """Read and sanitize a dataset's metadata file (handles BOM + bare tokens)."""
+    raw = (Path(dataset_path) / "metadata").read_bytes().decode("utf-8-sig").strip()
+    return json.loads(sanitize_metadata_json(raw))
+
+
+# ── Dataset cost & time-allocation policy (single source of truth) ───────────
 
 def estimate_dataset_cost(meta: dict, dataset_dir=None) -> float:
     """
@@ -84,28 +150,33 @@ def estimate_dataset_cost(meta: dict, dataset_dir=None) -> float:
     return (volume ** 0.4) * fw * class_factor
 
 
-def compute_allocations(costs: dict, pool_seconds: float,
-                        min_h: float = 2.0, max_h: float = 12.0) -> dict:
-    """Proportional allocation with floor/ceiling; re-scales if ceiling clips."""
-    names = list(costs)
-    raw = np.array([costs[n] for n in names], dtype=float)
-    if raw.sum() == 0:
-        raw = np.ones(len(names))
-    props = raw / raw.sum()
-    allocs = np.clip(props * pool_seconds, min_h * 3600, max_h * 3600)
-    if allocs.sum() > pool_seconds:
-        allocs *= pool_seconds / allocs.sum()
-    return dict(zip(names, allocs.tolist()))
+def halving_allocation(pool_s: float, n_remaining: int) -> float:
+    """
+    THE time-allocation policy. Everything that allocates time calls this.
+
+      - last dataset  → entire remaining pool (inherits all unused time)
+      - otherwise     → half the remaining pool
+                        (DS1 = pool/2, DS2 = leftover/2, DS3 = everything left)
+    """
+    if n_remaining <= 1:
+        return pool_s
+    return pool_s / 2
 
 
 class GlobalBudgetGovernor:
     """
-    Tracks cumulative time usage across datasets via predictions/.global_budget.json.
+    Owns the entire per-dataset time-budget lifecycle. Persists cumulative
+    usage across datasets in predictions/.global_budget.json so the allocation
+    survives the organizer creating a fresh Clock per dataset.
 
-    Call get_allocation() at NAS init to learn how many seconds this dataset
-    should consume. Call record_start() to mark when work begins. Call
-    record_done() when the full pipeline for this dataset is complete so the
-    next dataset's allocation is computed correctly.
+    Lifecycle (the ONLY contract between NAS and Trainer is this object,
+    handed over in-memory as metadata['_gbg'] — never written to disk):
+
+        gbg = GlobalBudgetGovernor(...)
+        gbg.begin_dataset(codename)      # NAS.__init__: start wall clock, fix allocation
+        gbg.allocation_s                 # NAS search: full allocation for this dataset
+        gbg.effective_remaining()        # Trainer: allocation minus elapsed wall time
+        gbg.finish_dataset()             # Trainer finally: record usage (idempotent)
 
     Never writes to any datasets/*/metadata file.
     """
@@ -115,9 +186,14 @@ class GlobalBudgetGovernor:
     def __init__(self, n_total: int = N_COMPETITION_DATASETS,
                  total_hours: float = TOTAL_COMPETITION_HOURS,
                  overhead_hours: float = COMPETITION_OVERHEAD_HOURS):
-        self.n_total = n_total
-        self.pool_s  = (total_hours - overhead_hours) * 3600
-        self._state  = self._load()
+        self.n_total      = n_total
+        self.pool_s       = (total_hours - overhead_hours) * 3600
+        self._state       = self._load()
+        self._wall_start  = None   # set by begin_dataset()
+        self.allocation_s = None   # set by begin_dataset()
+        self._done        = False  # finish_dataset() idempotency guard
+
+    # ── persistence ───────────────────────────────────────────────────────────
 
     def _load(self) -> dict:
         try:
@@ -135,60 +211,66 @@ class GlobalBudgetGovernor:
         self._STATE_FILE.parent.mkdir(exist_ok=True)
         self._STATE_FILE.write_text(json.dumps(self._state, indent=2))
 
-    def get_allocation(self, meta: dict, datasets_dir: Path = None) -> float:
-        """Return effective budget in seconds for the current dataset.
+    @classmethod
+    def reset_state(cls):
+        """Delete the persisted state file (fresh local test run)."""
+        if cls._STATE_FILE.exists():
+            cls._STATE_FILE.unlink()
+            print("  [GBG] Cleared stale state file — fresh run.")
 
-        Strategy (pure halving — predictable and matches the design spec):
-          - n_remaining == 1 → full remaining pool (last dataset takes everything unused)
-          - otherwise       → pool / 2  (first dataset keeps roughly half; surplus
-                              accumulates for subsequent datasets)
+    # ── allocation ────────────────────────────────────────────────────────────
 
-        The `datasets_dir` parameter is accepted for API compatibility but no longer
-        used for proportional allocation (proportional gave datasets with cheap cost
-        estimates too little time, conflicting with the halving design).
-        """
+    def get_allocation(self) -> float:
+        """Seconds this dataset should consume, per the halving policy."""
         n_done       = self._state.get('n_done', 0)
         seconds_used = self._state.get('seconds_used', 0.0)
         remaining    = max(0.0, self.pool_s - seconds_used)
         n_remaining  = max(1, self.n_total - n_done)
 
-        # Last dataset gets the entire remaining pool — no ceiling.
-        if n_remaining == 1:
-            print(f"  [GBG] last dataset → full pool alloc={remaining/3600:.2f}h"
-                  f"  (pool={remaining/3600:.2f}h, done={n_done}/{self.n_total})")
-            return remaining
-
-        # Halving: take half the remaining pool.
-        # DS1=pool/2, DS2=(pool-used1)/2, DS3=everything left.
-        alloc = remaining / 2
-        print(f"  [GBG] halving alloc={alloc/3600:.2f}h"
-              f"  (pool={remaining/3600:.2f}h ÷ 2, done={n_done}/{self.n_total})")
+        alloc = halving_allocation(remaining, n_remaining)
+        tag   = "last dataset → full pool" if n_remaining == 1 else "halving"
+        print(f"  [GBG] {tag} alloc={alloc/3600:.2f}h"
+              f"  (pool={remaining/3600:.2f}h, done={n_done}/{self.n_total})")
         return alloc
 
-    def _scan_costs(self, current_meta: dict, datasets_dir: Path) -> dict:
-        import re as _re, json as _json
-        costs = {}
-        if not datasets_dir.exists():
-            return costs
-        for p in sorted(datasets_dir.iterdir()):
-            if not (p.is_dir() and (p / "metadata").exists()):
-                continue
-            try:
-                raw = (p / "metadata").read_bytes().decode("utf-8-sig").strip()
-                raw = _re.sub(
-                    r':\s*(?:\?|N/A|NA|NaN|nan|None|undefined)(?=\s*[,}\]\r\n])',
-                    ': null', raw)
-                m   = _json.loads(raw)
-                costs[m.get('codename', p.name)] = estimate_dataset_cost(m, dataset_dir=p)
-            except Exception:
-                costs[p.name] = estimate_dataset_cost(current_meta, dataset_dir=p)
-        return costs
+    # ── lifecycle ─────────────────────────────────────────────────────────────
 
-    def record_start(self, dataset_name: str = ''):
+    def begin_dataset(self, dataset_name: str = '') -> float:
+        """Fix this dataset's allocation and start its wall clock."""
+        self._wall_start  = time.perf_counter()
+        self.allocation_s = self.get_allocation()
         self._state['current'] = dataset_name
         self._save()
+        return self.allocation_s
 
-    def record_done(self, seconds_actual: float):
+    def current_allocation(self) -> float:
+        """
+        This dataset's allocation in seconds. Computes it on demand if
+        begin_dataset() hasn't run yet, so callers can never read a None
+        allocation (defensive — normal flow sets it in begin_dataset()).
+        """
+        if self.allocation_s is None:
+            self.allocation_s = self.get_allocation()
+        return self.allocation_s
+
+    def elapsed(self) -> float:
+        """Wall seconds since begin_dataset() (0 if not begun)."""
+        if self._wall_start is None:
+            return 0.0
+        return time.perf_counter() - self._wall_start
+
+    def effective_remaining(self) -> float:
+        """Allocation minus elapsed wall time — what's truly left for this dataset."""
+        if self.allocation_s is None:
+            return self.pool_s
+        return max(0.0, self.allocation_s - self.elapsed())
+
+    def finish_dataset(self):
+        """Record this dataset's actual usage. Safe to call more than once."""
+        if self._done:
+            return
+        self._done = True
+        seconds_actual = self.elapsed()
         self._state['n_done']       = self._state.get('n_done', 0) + 1
         self._state['seconds_used'] = self._state.get('seconds_used', 0.0) + seconds_actual
         self._save()

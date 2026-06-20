@@ -9,10 +9,12 @@ class FamilyProfile:
     max_pool_steps: int          = 4     # max downsampling stages
     is_anisotropic: bool         = False # spatial dims very unequal
     aniso_axis: Optional[str]    = None  # 'H' or 'W' — larger spatial axis
-    enable_attention: bool       = True  # LightAttentionBlock allowed
+    enable_attention: bool       = True  # LightAttentionBlock allowed globally
+                                         # per-stage spatial check in repair overrides
     force_groupnorm: bool        = False # must use GroupNorm instead of BN
     min_channels: int            = 16
     max_params_m: float          = 50.0  # soft cap in millions
+    augment_hflip: bool          = True  # whether DataProcessor applies RandomHorizontalFlip
     # Hints (for initial sampling bias only — NOT hard constraints)
     preferred_blocks: List[str]  = field(default_factory=list)
     forbidden_blocks: List[str]  = field(default_factory=list)
@@ -30,7 +32,7 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
     aniso_ratio  = spatial_max / max(spatial_min, 1)
 
     # ── anisotropic: one spatial dim >> other (e.g. 1D sequences stored as 2D)
-    # Example: Cryptic 1×6×768 → W is the "sequence" axis
+    # Example: Cryptic 1×6×768 → W is the "sequence" axis (BERT embeddings)
     if aniso_ratio >= 6.0 and spatial_min <= 8:
         axis = 'W' if W > H else 'H'
         return FamilyProfile(
@@ -38,10 +40,12 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
             max_pool_steps  = min(2, int(spatial_min).bit_length() - 1),
             is_anisotropic  = True,
             aniso_axis      = axis,
-            enable_attention= spatial_area <= 128,
+            enable_attention= False,     # even after max pooling, total spatial > 256
             force_groupnorm = True,
-            preferred_blocks= ['AnisotropicBlock', 'ChannelMixingBlock', 'ConvBlock'],
-            forbidden_blocks= ['LightAttentionBlock'] if spatial_area > 128 else [],
+            augment_hflip   = False,     # flipping W reverses embedding dim indices (meaningless)
+            preferred_blocks= ['AnisotropicBlock', 'ChannelMixingBlock',
+                               'GlobalContextBlock', 'ConvBlock'],
+            forbidden_blocks= ['LightAttentionBlock'],
         )
 
     # ── small_grid: tiny spatial (≤8×8), typically symbolic/board-like
@@ -96,14 +100,18 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
         )
 
     # ── visual_large: standard large-resolution images
-    # Example: Myofibre 3×128×128, CIFARTile 3×64×64 or larger
+    # Example: Myofibre 3×128×128, GeoClassing 3×64×64, CIFARTile 3×96×96+
     if spatial_min >= 64:
+        # 64×64 → 4 pools → 4×4 final (standard for this resolution)
+        # 128×128+ → 5 pools → 4×4 final
+        pool_steps = 5 if spatial_min >= 128 else 4
         return FamilyProfile(
             name            = 'visual_large',
-            max_pool_steps  = 5,
-            enable_attention= spatial_area <= 4096,
+            max_pool_steps  = pool_steps,
+            enable_attention= True,  # per-stage repair enforces the 256-token limit
             force_groupnorm = False,
-            preferred_blocks= ['MBConvBlock', 'ResidualBlock', 'SepConvBlock', 'BottleneckBlock'],
+            preferred_blocks= ['MBConvBlock', 'ResidualBlock', 'SepConvBlock',
+                               'BottleneckBlock', 'DilatedConvBlock'],
             forbidden_blocks= [],
         )
 
@@ -125,6 +133,7 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
         max_pool_steps  = 2,
         enable_attention= spatial_area <= 256,
         force_groupnorm = False,
-        preferred_blocks= ['ConvBlock', 'ResidualBlock', 'SepConvBlock'],
+        preferred_blocks= ['ConvBlock', 'ResidualBlock', 'SepConvBlock',
+                           'GlobalContextBlock', 'DilatedConvBlock'],
         forbidden_blocks= [],
     )

@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch import optim
 from sklearn.metrics import accuracy_score
 
-from helpers import show_time, set_seeds, GLOBAL_SEED
+from helpers import show_time, set_seeds, GLOBAL_SEED, free_gpu
 
 # train_frac is a fraction of the TOTAL clock budget (not of remaining time).
 # search_frac + train_frac should sum to ≤ 0.95, leaving ~5% for predict/overhead.
@@ -22,11 +22,11 @@ _WEIGHT_DECAY = 1e-4
 # Early stopping defaults
 _ES_ENABLED          = True
 _ES_PATIENCE         = 20     # consecutive regression epochs before stopping
-_ES_PLATEAU_PATIENCE = 15     # consecutive plateau epochs before stopping
+_ES_PLATEAU_PATIENCE = 20     # consecutive plateau epochs before stopping
 _ES_MIN_EPOCHS       = 10     # warmup: ES cannot trigger before this epoch
-_ES_DELTA_START      = 0.005  # initial improvement threshold (0.5 pp)
+_ES_DELTA_START      = 0.002  # initial improvement threshold (0.2 pp)
 _ES_DELTA_MIN        = 0.001  # floor for improvement delta (0.1 pp)
-_ES_DELTA_DECAY      = 5      # improvements before halving delta
+_ES_DELTA_DECAY      = 3      # improvements before halving delta
 _ES_REGRESSION_DELTA = 0.010  # fall >1 pp below best → counts as bad epoch
 
 
@@ -110,15 +110,16 @@ class Trainer:
             print(traceback.format_exc())
             return self.model
         finally:
-            # Always notify GBG of completion, even on failure, so state stays consistent
+            # Always notify GBG of completion, even on failure, so state stays
+            # consistent for the next dataset. finish_dataset() is idempotent.
             gbg = self.metadata.get('_gbg')
-            if gbg is not None and not self.metadata.get('_gbg_done'):
-                self.metadata['_gbg_done'] = True   # guard against double-call
-                wall_start = self.metadata.get('_pipeline_wall_start', time.perf_counter())
-                gbg.record_done(seconds_actual=time.perf_counter() - wall_start)
+            if gbg is not None:
+                gbg.finish_dataset()
 
     def _train(self):
         set_seeds(self.metadata.get('seed', GLOBAL_SEED))
+        # Start training with the NAS search phase's idle GPU memory reclaimed.
+        free_gpu()
         self.model.to(self.device)
 
         # Complementary fractions of the TOTAL clock budget:
@@ -128,15 +129,12 @@ class Trainer:
         train_frac   = self.metadata.get('train_frac',   _TRAIN_FRAC)
         weight_decay = self.metadata.get('weight_decay', _WEIGHT_DECAY)
 
-        eff_s = self.metadata.get('effective_budget_s')
-        if eff_s is not None:
+        gbg = self.metadata.get('_gbg')
+        if gbg is not None:
             # GBG is active: training gets everything left of the allocated budget.
-            # elapsed already accounts for DataProcessor + NAS, so no fraction needed.
-            # clock.check() is the hard ceiling (organizer's clock).
-            elapsed = time.perf_counter() - self.metadata.get('_pipeline_wall_start',
-                                                               time.perf_counter())
-            effective_remaining = max(0.0, eff_s - elapsed)
-            train_budget = min(self.clock.check(), effective_remaining)
+            # effective_remaining() already accounts for NAS time, so no fraction
+            # needed. clock.check() is the hard ceiling (organizer's clock).
+            train_budget = min(self.clock.check(), gbg.effective_remaining())
         else:
             # Legacy fallback when GBG is not available: estimate from fractions.
             remaining_frac = max(1.0 - search_frac, 1e-6)
@@ -177,7 +175,10 @@ class Trainer:
         best_state = None
         epoch_times: list[float] = []
         epoch = 0
-        _consecutive_oom = 0   # track persistent OOM to escalate
+        # Adaptive micro-batch: None = use the full batch. On OOM we halve it and
+        # accumulate gradients so the EFFECTIVE batch size never changes. Persists
+        # across epochs so we don't re-discover the limit every epoch.
+        self._micro_bs = None
 
         while True:
             t_left = deadline - time.perf_counter()
@@ -196,37 +197,15 @@ class Trainer:
 
             for x, y in self.train_dl:
                 x, y = x.to(self.device), y.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
 
-                try:
-                    with torch.amp.autocast('cuda', enabled=use_amp):
-                        out  = self.model(x)
-                        loss = criterion(out, y)
-
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    _consecutive_oom = 0
-                except torch.cuda.OutOfMemoryError:
-                    optimizer.zero_grad(set_to_none=True)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    _consecutive_oom += 1
-                    print(f"  [OOM] skipping batch ({_consecutive_oom} consecutive)")
-                    if _consecutive_oom >= 3:
-                        raise RuntimeError(
-                            "3 consecutive CUDA OOM errors — model too large for GPU. "
-                            "Check repair.py memory_budget_mb."
-                        )
-                    continue
+                out = self._forward_backward(x, y, optimizer, criterion,
+                                             scaler, use_amp)
 
                 if self._xm is not None:
                     self._xm.mark_step()
 
-                labels += y.cpu().tolist()
-                preds  += out.detach().argmax(1).cpu().tolist()
+                labels += y[:out.size(0)].cpu().tolist()
+                preds  += out.argmax(1).cpu().tolist()
 
             scheduler.step()
             epoch += 1
@@ -273,14 +252,70 @@ class Trainer:
         return self.model
 
     # ------------------------------------------------------------------
+    def _forward_backward(self, x, y, optimizer, criterion, scaler, use_amp):
+        """
+        One optimizer step on (x, y), resilient to CUDA OOM.
+
+        If a prior batch OOM'd, self._micro_bs holds a chunk size < full batch.
+        The batch is split into chunks of that size and gradients are accumulated
+        across them, so the EFFECTIVE batch (and thus the gradient) is identical
+        to a single full-batch step — only peak activation memory shrinks. Each
+        chunk's mean loss is weighted by its sample fraction so the sum equals the
+        full-batch mean. (Anisotropic family uses GroupNorm, which is batch-size
+        independent → exactly equivalent; BN families drift slightly, acceptable
+        since this only triggers on OOM.)
+
+        On OOM we halve the chunk size and retry the same batch. If it still OOMs
+        at chunk size 1, the model genuinely cannot fit and we raise.
+
+        Returns the concatenated detached logits (ordered) for metric tracking.
+        """
+        bs = x.size(0)
+        optimizer.zero_grad(set_to_none=True)
+        while True:
+            chunk = bs if self._micro_bs is None else self._micro_bs
+            try:
+                outs = []
+                for i in range(0, bs, chunk):
+                    xs, ys = x[i:i + chunk], y[i:i + chunk]
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        out  = self.model(xs)
+                        loss = criterion(out, ys) * (xs.size(0) / bs)
+                    scaler.scale(loss).backward()
+                    outs.append(out.detach())
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                return torch.cat(outs, dim=0)
+            except torch.cuda.OutOfMemoryError:
+                optimizer.zero_grad(set_to_none=True)
+                free_gpu()
+                new_chunk = max(1, chunk // 2)
+                if new_chunk == chunk:   # already at 1 and still OOM
+                    raise RuntimeError(
+                        "CUDA OOM even at micro-batch size 1 — model genuinely "
+                        "exceeds GPU memory. Tighten repair.py memory estimator."
+                    )
+                self._micro_bs = new_chunk
+                print(f"  [OOM] micro-batch → {self._micro_bs}"
+                      f"  (effective batch {bs} preserved via grad accumulation)")
+
+    # ------------------------------------------------------------------
     def _evaluate(self, loader):
         self.model.eval()
         labels, preds = [], []
+        # Mirror the training micro-batch limit so eval can't OOM where train fit.
+        eval_chunk = self._micro_bs if getattr(self, '_micro_bs', None) else None
         with torch.no_grad():
             for x, y in loader:
-                out = self.model(x.to(self.device))
+                x = x.to(self.device)
+                bs = x.size(0)
+                chunk = eval_chunk or bs
+                for i in range(0, bs, chunk):
+                    out = self.model(x[i:i + chunk])
+                    preds += out.argmax(1).cpu().tolist()
                 labels += y.tolist()
-                preds  += out.argmax(1).cpu().tolist()
         return accuracy_score(labels, preds)
 
     # ------------------------------------------------------------------
@@ -337,7 +372,14 @@ class Trainer:
     def predict(self, test_loader):
         self.model.to(self.device).eval()
         preds = []
+        # Honour the micro-batch limit discovered during training so inference
+        # over the (often larger) test set cannot OOM where training fit.
+        eval_chunk = self._micro_bs if getattr(self, '_micro_bs', None) else None
         with torch.no_grad():
             for x in test_loader:
-                preds += self.model(x.to(self.device)).argmax(1).cpu().tolist()
+                x = x.to(self.device)
+                bs = x.size(0)
+                chunk = eval_chunk or bs
+                for i in range(0, bs, chunk):
+                    preds += self.model(x[i:i + chunk]).argmax(1).cpu().tolist()
         return preds

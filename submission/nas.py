@@ -7,9 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from pathlib import Path
-
-from helpers import (show_time, set_seeds, GLOBAL_SEED,
+from helpers import (show_time, set_seeds, GLOBAL_SEED, free_gpu,
                      GlobalBudgetGovernor,
                      N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS)
 
@@ -117,23 +115,18 @@ class NAS:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Release any GPU memory the previous dataset may have left behind
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        free_gpu()
 
         # ── Global Budget Governor ────────────────────────────────────────────
-        self._wall_start = time.perf_counter()
-        gbg = GlobalBudgetGovernor(
+        # The governor owns the whole budget lifecycle (allocation, wall clock,
+        # usage recording). It is handed to Trainer through the in-memory
+        # metadata dict under ONE key — never written to any dataset file.
+        self._gbg = GlobalBudgetGovernor(
             n_total     = metadata.get('n_competition_datasets', N_COMPETITION_DATASETS),
             total_hours = metadata.get('total_competition_hours', TOTAL_COMPETITION_HOURS),
         )
-        self._effective_budget_s = gbg.get_allocation(metadata)
-        # Inject into in-memory metadata dict so Trainer can read it (no disk writes)
-        metadata['effective_budget_s']  = self._effective_budget_s
-        metadata['_gbg']                = gbg
-        metadata['_pipeline_wall_start'] = self._wall_start
-        gbg.record_start(metadata.get('codename', 'unknown'))
+        self._gbg.begin_dataset(metadata.get('codename', 'unknown'))
+        metadata['_gbg'] = self._gbg
 
     def search(self):
         try:
@@ -160,7 +153,7 @@ class NAS:
         tourney_k = self.metadata.get('tournament_size', _TOURNAMENT_SIZE)
         search_frac   = self.metadata.get('search_frac', _SEARCH_FRAC)
         # Cap search to our effective per-dataset budget, not just clock remaining
-        search_budget = min(self.clock.check(), self._effective_budget_s) * search_frac
+        search_budget = min(self.clock.check(), self._gbg.current_allocation()) * search_frac
         t_search_start = time.perf_counter()
         print(f"  NAS | sf={search_frac:.2f} → budget={show_time(search_budget)}"
               f"  pop={n_pop} rounds={n_rounds} | device={self.device}")
@@ -235,6 +228,32 @@ class NAS:
             with torch.no_grad():
                 dummy = torch.randn(2, in_c, H, W).to(self.device)
                 model.to(self.device)(dummy)
+
+            # Save arch diagram + genotype JSON
+            import json
+            from pathlib import Path
+            pred_dir = Path('predictions')
+            pred_dir.mkdir(exist_ok=True)
+            codename = self.metadata.get('codename', 'unknown')
+            try:
+                geno_path = pred_dir / f'{codename}_genotype.json'
+                geno_path.write_text(json.dumps(best.genotype.to_dict(), indent=2))
+                print(f"  Genotype JSON  → {geno_path}")
+            except Exception as eg:
+                print(f"  [NAS] Genotype save failed: {eg}")
+            try:
+                from arch_viz import save_arch
+                n_p = sum(p.numel() for p in model.parameters())
+                viz_path = pred_dir / f'{codename}_arch.png'
+                ok = save_arch(best.genotype, self.metadata, viz_path,
+                               proxy_score=best.fitness, n_params=n_p)
+                if ok:
+                    print(f"  Arch diagram   → {viz_path}")
+            except Exception as ev:
+                print(f"  [NAS] Arch viz failed: {ev}")
+
+            # Release the NAS search memory before handing the model to training.
+            free_gpu()
             return model.cpu()
         except Exception as e:
             print(f"  [NAS] Model build failed ({e}) — using legacy fallback.")
@@ -284,8 +303,7 @@ class NAS:
                     best_model = copy.deepcopy(model).cpu()
             except RuntimeError as e:
                 print(f"  Architecture skipped: {e}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                free_gpu()
 
         if best_model is None:
             best_model = SearchableCNN(in_c, n_cls, _FALLBACK['medium'], hw)

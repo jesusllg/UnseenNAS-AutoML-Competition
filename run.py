@@ -15,18 +15,20 @@ Usage:
 
 Time budget modes (mutually exclusive):
   --time HOURS        Fixed per-dataset time limit (overrides metadata).
-  --total-time HOURS  Global pool; each dataset gets pool/remaining datasets,
-                      with --min-time as a floor. Saved time is redistributed.
+  --total-time HOURS  Global pool with halving allocation: each dataset gets
+                      pool/2 (the last one gets everything left), floored at
+                      --min-time. Saved time flows to the remaining datasets.
+  (default)           Same halving policy via the GlobalBudgetGovernor with
+                      the competition constants (24h total, 3 datasets).
+
+Datasets always run cheapest→heaviest so surplus time reaches the heavy ones.
 """
 
 import argparse
 import copy
 import json
-import math
 import numpy as np
-import os
 import pickle as pkl
-import re
 import sys
 import time
 import traceback
@@ -39,25 +41,12 @@ sys.path.insert(0, str(Path(__file__).parent / "submission"))
 from nas import NAS
 from data_processor import DataProcessor
 from trainer import Trainer
-from helpers import estimate_dataset_cost, GlobalBudgetGovernor, \
-    N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS
+from helpers import (show_time, load_metadata, estimate_dataset_cost,
+                     halving_allocation, GlobalBudgetGovernor,
+                     N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS)
 
 
 # ── helpers (mirrors evaluation/main.py) ─────────────────────────────────────
-
-def show_time(seconds):
-    def div_rem(n, d):
-        return math.floor(n / d), int(n - math.floor(n / d) * d)
-    if seconds < 60:
-        return f"{seconds:.2f}s"
-    elif seconds < 3600:
-        m, s = div_rem(seconds, 60)
-        return f"{m}m,{s}s"
-    else:
-        h, s  = div_rem(seconds, 3600)
-        m, s  = div_rem(s, 60)
-        return f"{h}h,{m}m,{s}s"
-
 
 class Clock:
     def __init__(self, hours):
@@ -69,10 +58,11 @@ class Clock:
 
 class GlobalTimeBudget:
     """
-    Dynamically redistributes a total time pool across datasets.
+    Dynamically redistributes a total time pool across datasets (--total-time).
 
-    Each dataset gets at least min_seconds; unused time flows to the rest.
-    Call next_allocation() before each dataset, then record_usage() after.
+    Allocation policy is helpers.halving_allocation — the same single source
+    of truth the GlobalBudgetGovernor uses, so the local clock can never be
+    smaller than the GBG's internal allocation.
     """
 
     def __init__(self, total_hours, n_datasets, min_hours=0.1):
@@ -80,11 +70,10 @@ class GlobalTimeBudget:
         self.n_remaining = n_datasets
         self.min_s       = min_hours * 3600
 
-    def next_allocation(self):
-        if self.n_remaining <= 0:
-            return self.min_s
-        per = self.pool / self.n_remaining
-        return max(per, self.min_s)
+    def next_allocation_h(self):
+        """Hours for the next dataset (halving policy, floored at min)."""
+        alloc_s = halving_allocation(self.pool, self.n_remaining)
+        return max(alloc_s, self.min_s) / 3600
 
     def record_usage(self, used_seconds):
         self.pool        = max(0.0, self.pool - used_seconds)
@@ -94,31 +83,6 @@ class GlobalTimeBudget:
             print(f"  [Budget] used={show_time(used_seconds)}"
                   f"  pool={show_time(self.pool)}"
                   f"  ~{show_time(carry)}/dataset remaining")
-
-
-def _sanitize_metadata_json(raw: str) -> str:
-    """
-    Coerce non-standard bare values in metadata JSON to valid JSON equivalents.
-    Handles: ? NA N/A NaN nan Inf -Inf Infinity None undefined True False.
-    Quoted string values like "benchmark": "NA" are left untouched.
-    """
-    _NULL_TOKENS = (
-        r'\?'
-        r'|N/A|NA'
-        r'|NaN|nan'
-        r'|[+-]?[Ii]nfinity|[+-]?[Ii]nf'
-        r'|None'
-        r'|undefined'
-    )
-    raw = re.sub(r':\s*(?:' + _NULL_TOKENS + r')(?=\s*[,}\]\r\n])', ': null', raw)
-    raw = re.sub(r':\s*True(?=\s*[,}\]\r\n])',  ': true',  raw)
-    raw = re.sub(r':\s*False(?=\s*[,}\]\r\n])', ': false', raw)
-    return raw
-
-
-def load_metadata(dataset_path: Path) -> dict:
-    raw = (dataset_path / "metadata").read_bytes().decode("utf-8-sig").strip()
-    return json.loads(_sanitize_metadata_json(raw))
 
 
 def load_dataset(dataset_path: Path, truncate: bool):
@@ -291,15 +255,15 @@ def main():
                     help="Consecutive non-improving epochs before stopping. (default: 20)")
     ap.add_argument("--es-min-epochs",   type=int,   default=10,
                     help="Minimum epochs before ES can trigger. (default: 10)")
-    ap.add_argument("--es-delta-start",  type=float, default=0.005,
-                    help="Initial min-improvement threshold. (default: 0.005 = 0.5pp)")
+    ap.add_argument("--es-delta-start",  type=float, default=0.002,
+                    help="Initial min-improvement threshold. (default: 0.002 = 0.2pp)")
     ap.add_argument("--es-delta-min",    type=float, default=0.001,
                     help="Floor for delta after decay. (default: 0.001 = 0.1pp)")
-    ap.add_argument("--es-delta-decay",       type=int,   default=5,
-                    help="Improvements before halving delta. (default: 5)")
-    ap.add_argument("--es-plateau-patience", type=int,   default=15,
-                    help="Consecutive plateau epochs before stopping. (default: 15)")
-    ap.add_argument("--es-regression-delta", type=float, default=0.005,
+    ap.add_argument("--es-delta-decay",       type=int,   default=3,
+                    help="Improvements before halving delta. (default: 3)")
+    ap.add_argument("--es-plateau-patience", type=int,   default=20,
+                    help="Consecutive plateau epochs before stopping. (default: 20)")
+    ap.add_argument("--es-regression-delta", type=float, default=0.010,
                     help="Fall >X below best to count as bad epoch. (default: 0.010 = 1pp)")
     args = ap.parse_args()
 
@@ -317,10 +281,7 @@ def main():
 
     # Reset GBG state at the start of every run.py invocation so a previously
     # killed or partial test run doesn't leave stale n_done counts behind.
-    _gbg_state = pred_dir / ".global_budget.json"
-    if _gbg_state.exists():
-        _gbg_state.unlink()
-        print("  [GBG] Cleared stale state file — fresh run.")
+    GlobalBudgetGovernor.reset_state()
 
     if not datasets_dir.exists():
         print(f"ERROR: datasets directory not found: {datasets_dir}")
@@ -357,55 +318,58 @@ def main():
     else:
         print(f"Running all {n_ds}: {[p.name for p in targets]}")
 
+    # ── Order datasets cheapest→heaviest (ALL modes) ──────────────────────────
+    # Easy/fast datasets must run first so their unused time flows to the heavy
+    # ones at the end (GBG halving gives the last dataset the entire remaining
+    # pool). Previously this sort only ran with --total-time, so in default mode
+    # the order was alphabetical and a heavy dataset like CIFARTile could run
+    # first and starve everything after it.
+    costs = {}
+    for p in targets:
+        try:
+            m = load_metadata(p)
+            costs[p.name] = estimate_dataset_cost(m, dataset_dir=p)
+        except Exception:
+            costs[p.name] = float('inf')   # unreadable metadata → assume heavy, run last
+    if args.dataset:
+        # User gave an explicit list — keep their order but warn if it's suboptimal
+        cost_order = sorted(targets, key=lambda p: costs[p.name])
+        if [p.name for p in cost_order] != [p.name for p in targets]:
+            print(f"NOTE: running in your given order. Cheapest→heaviest would be:"
+                  f" {[p.name for p in cost_order]}")
+    else:
+        targets = sorted(targets, key=lambda p: costs[p.name])
+    if len(targets) > 1:
+        print("Execution order (cheapest→heaviest):")
+        for p in targets:
+            print(f"  {p.name}: cost={costs[p.name]:,.0f}")
+
     # ── Time budget setup ─────────────────────────────────────────────────────
     budget = None
     if args.total_time is not None:
-        # Load metadata and compute geometry-based cost proxy for each dataset
-        costs = {}
-        meta_cache = {}
-        for p in targets:
-            try:
-                m = load_metadata(p)
-                meta_cache[p.name] = m
-                costs[p.name] = estimate_dataset_cost(m, dataset_dir=p)
-            except Exception:
-                costs[p.name] = 1.0
-
-        # Sort cheapest→most-expensive so surplus time flows to harder datasets
-        targets = sorted(targets, key=lambda p: costs[p.name])
-
         budget = GlobalTimeBudget(args.total_time, n_ds, args.min_time)
         per = args.total_time / n_ds
         print(f"Global budget: {args.total_time}h / {n_ds} datasets"
-              f" = ~{per:.2f}h initial each (floor {args.min_time}h) — sorted by cost:")
-        for p in targets:
-            print(f"  {p.name}: cost={costs[p.name]:.2f}")
+              f" = ~{per:.2f}h initial each (floor {args.min_time}h)")
 
     results = {}
     for ds_path in targets:
-        # Determine time allocation for this dataset
+        # Determine the local clock for this dataset. In every mode the clock
+        # must be >= the GBG's internal allocation, otherwise min(clock, GBG)
+        # collapses to the clock and the GBG never controls anything. Both
+        # GlobalTimeBudget and GlobalBudgetGovernor use helpers.halving_allocation,
+        # so they always agree by construction.
         if budget is not None:
-            # Halving: give pool/2 so the clock is always >= GBG allocation.
-            # Equal-thirds gave 8h while GBG said 11.75h → clock won, GBG was useless.
-            n_rem = budget.n_remaining
-            pool_h = budget.pool / 3600
-            hours = (pool_h / 2) if n_rem > 1 else pool_h
-            hours = max(hours, args.min_time)
+            hours = budget.next_allocation_h()
         elif args.time is not None:
             hours = args.time
         else:
-            # No explicit time flag — derive clock from the same GBG halving
-            # logic that NAS uses internally.  Without this, the metadata
-            # time_limit (e.g. 7 h) would be less than the GBG allocation
-            # (e.g. 11.75 h), making min(clock, GBG) = 7 h and losing the
-            # extra budget.  Reading the GBG state here (before NAS touches
-            # it) guarantees clock >= GBG allocation, so GBG controls.
-            _gbg_preview = GlobalBudgetGovernor(
+            # Default mode: read the same persisted GBG state NAS will read,
+            # so the clock equals the GBG allocation exactly.
+            hours = GlobalBudgetGovernor(
                 n_total=N_COMPETITION_DATASETS,
                 total_hours=TOTAL_COMPETITION_HOURS,
-            )
-            meta_preview = load_metadata(ds_path)
-            hours = _gbg_preview.get_allocation(meta_preview) / 3600
+            ).get_allocation() / 3600
 
         ok, runtime = run_one(ds_path, args, pred_dir, hours)
         results[ds_path.name] = ok
