@@ -439,7 +439,15 @@ network. The combined score is
 \begin{equation}
 S \;=\; E + P + T \;-\; \lambda_c \log(\#\text{params}+1),
 \end{equation}
-with $\lambda_c=0.1$, after a Kaiming fan-in re-initialization.
+with $\lambda_c=0.05$, after a Kaiming fan-in re-initialization. The
+complexity weight is deliberately small: it is a tie-breaker toward lighter,
+faster models --- which matters under tight time and hardware budgets --- not a
+dominant pressure. Because the penalty $-\lambda_c\log(\#\text{params})$ is
+constant and floor-less, an overly large weight lets a long search trade real
+capacity for marginal proxy gains; we observed exactly this over-shrinking at
+$\lambda_c=0.1$. The hard size bound is the memory guard of
+\S\ref{sec:memory} (repair R11, $\sim$80\% of GPU); $\lambda_c$ only orders the
+already-feasible candidates.
 
 \paragraph{Graceful degradation.} Some geometries make a proxy ill-defined ---
 e.g.\ a $9\!\to\!4$ down-sampling makes the trainability Jacobian's spatial
@@ -466,11 +474,20 @@ convergence. Three elements are tailored to our setting:
 \item \textbf{Mutation-scale annealing.} The mutation operator anneals from
   \emph{large} (replace a whole stage or a global gene) early, through
   \emph{medium}, to \emph{small} (perturb one field) late, trading exploration
-  for exploitation as the budget is consumed.
+  for exploitation as the search progresses.
 \item \textbf{Time as the true terminator.} The nominal round count
   ($2000$) is a ceiling; the search actually runs until a fraction of the
   wall-clock budget is spent, so it scales to whatever time the dataset is
   allotted.
+\item \textbf{Selection pressure tuned for a noisy proxy.} We use a population
+  of $P{=}100$ with tournament size $10$ (selection intensity $0.10$). Real
+  et al.~\cite{regevo2019} used $S{=}25$ with \emph{true} validation accuracy as
+  fitness; a zero-cost proxy is far noisier, and high selection pressure over a
+  long search amplifies that noise --- the search exploits the proxy's mistakes,
+  converging on architectures that game the proxy (e.g.\ minimal parameters,
+  high proxy score, poor real accuracy). Lowering the tournament size increases
+  exploration and robustness to proxy noise without enlarging the population
+  (which would slow initialization).
 \end{itemize}
 
 \begin{algorithm}[t]
