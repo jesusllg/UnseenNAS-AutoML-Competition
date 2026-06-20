@@ -56,9 +56,9 @@ class DataProcessor:
         normalize = transforms.Normalize(mean=mean.tolist(), std=std.tolist())
 
         # Whether to apply RandomHorizontalFlip depends on the geometry family.
-        # Disabled for anisotropic (flipping W reverses BERT embedding dim indices)
-        # and compact_general (flipping W reverses character position order in images
-        # like Gutenberg where left→right ordering is semantically meaningful).
+        # Anisotropic data (extreme aspect ratio ≥6×) likely has sequential structure
+        # along the long axis; flipping that axis may invalidate positional semantics.
+        # All other families default to flipping on.
         family = infer_family(x.shape[1], h, w, n_cls)
         use_hflip = getattr(family, 'augment_hflip', True)
         flip = [transforms.RandomHorizontalFlip()] if use_hflip else []

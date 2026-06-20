@@ -128,13 +128,11 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
         )
 
     # ── compact_general: everything else (small but not tiny)
-    # Example: Gutenberg 1×27×18 — sparse character-position images (left→right order matters)
     return FamilyProfile(
         name            = 'compact_general',
         max_pool_steps  = 2,
         enable_attention= spatial_area <= 256,
         force_groupnorm = False,
-        augment_hflip   = False,    # position-ordered data (characters, structured patterns)
         preferred_blocks= ['ConvBlock', 'ResidualBlock', 'SepConvBlock',
                            'GlobalContextBlock', 'DilatedConvBlock'],
         forbidden_blocks= [],
