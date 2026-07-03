@@ -31,7 +31,8 @@ DROP_PATH_LIST    = [0.0, 0.05, 0.1, 0.2]
 GROUP_W_LIST      = [4, 8, 16, 32]
 HEAD_TYPES        = ['GapLinear', 'GmpLinear', 'GapGmpLinear', 'FlattenMlp',
                      'AttentionPool', 'SpatialPyramidPool', 'GatedPool']
-STEM_TYPES        = ['conv3x3', 'conv7x7', 'conv1x1', 'double_conv']
+STEM_TYPES        = ['conv3x3', 'conv7x7', 'conv1x1', 'double_conv',
+                     'conv3x3_s2', 'conv7x7_s2']
 NECK_TYPES        = ['none', 'conv1x1', 'global_avg']
 DOWNSAMPLE_OPS    = ['stride2', 'maxpool', 'avgpool', 'identity']
 SKIP_MODES        = ['none', 'residual', 'dense']
@@ -40,6 +41,11 @@ ACT_TYPES         = ['relu', 'silu', 'gelu']
 
 MAX_STAGES = 5
 DEFAULT_N_STAGES = 4
+
+
+def stem_stride(stem_type: str) -> int:
+    """Spatial stride a stem applies (the '_s2' variants halve H and W)."""
+    return 2 if stem_type.endswith('_s2') else 1
 
 # ── Cardinality map (for sampling / mutation) ──────────────────────────────────
 STAGE_FIELD_CARDINALITY: Dict[str, int] = {

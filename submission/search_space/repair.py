@@ -2,11 +2,12 @@ import math
 from typing import Optional
 
 from .genotype import (
-    Genotype,
+    Genotype, stem_stride,
     CHANNEL_LIST, KERNEL_LIST, N_BLOCKS_LIST, EXPANSION_LIST,
     DILATION_LIST, MAX_STAGES,
 )
 from .family import FamilyProfile
+from .builder import compute_output_spatial
 
 
 # ── Lightweight param estimator ───────────────────────────────────────────────
@@ -66,17 +67,21 @@ def _block_mid_channels(block_type: str, c_in: int, c_out: int, expand: int) -> 
 
 
 def estimate_activations_mb(genotype: Genotype, C: int, H: int, W: int,
-                             batch_size: int = 32) -> float:
+                             batch_size: int = 32, aniso_axis=None) -> float:
     """
     Estimate peak training memory (MB, float32 basis).
 
     Accounts for:
+      - Strided stems and (for anisotropic families) axis-aware pooling, so the
+        tracked spatial matches what the builder actually constructs
       - Output activation of each stage (stored for backward pass)
       - Intermediate activation within blocks, sized per block type (only MBConv
         and ChannelMixing expand channels; see _block_mid_channels)
       - Training factor ×3 for backward gradients + Adam m/v states
     """
     h, w = H, W
+    if stem_stride(genotype.stem_type) == 2:
+        h, w = max(1, (h + 1) // 2), max(1, (w + 1) // 2)
     total_elements = 0
     c_in = CHANNEL_LIST[genotype.stem_channels]
     total_elements += batch_size * c_in * h * w  # stem output
@@ -85,8 +90,13 @@ def estimate_activations_mb(genotype: Genotype, C: int, H: int, W: int,
         c_out  = CHANNEL_LIST[gene.channels_idx]
         expand = EXPANSION_LIST[gene.expansion_idx]
         n_blk  = N_BLOCKS_LIST[gene.n_blocks]
-        h = _actual_spatial(h, gene.downsample)
-        w = _actual_spatial(w, gene.downsample)
+        if gene.downsample == 'identity' or aniso_axis is None:
+            h = _actual_spatial(h, gene.downsample)
+            w = _actual_spatial(w, gene.downsample)
+        elif aniso_axis == 'W':   # aniso pools halve only the long axis
+            w = max(1, w // 2)
+        else:                     # aniso_axis == 'H'
+            h = max(1, h // 2)
 
         # Output activation (must be kept for backward pass)
         total_elements += batch_size * c_out * h * w
@@ -155,31 +165,53 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
         if stage.block_type in family.forbidden_blocks:
             stage.block_type = 'ConvBlock'
 
-    # R4: LightAttentionBlock requires small spatial (≤256 total)
+    # R4: family-level attention ban (rare — per-stage rule (e) is the normal
+    # gate; this only fires if a family explicitly disables attention outright)
     if not family.enable_attention:
         for stage in g.active_stages:
             if stage.block_type == 'LightAttentionBlock':
                 stage.block_type = 'ConvBlock'
+
+    # R4b: strided stems need spatial room. Demote to the stride-1 variant on
+    # small inputs (halving 27×18 in the stem wastes most of the signal) and on
+    # anisotropic data (a symmetric stem stride would crush the short axis).
+    if stem_stride(g.stem_type) == 2 and (min(H, W) < 32 or family.is_anisotropic):
+        g.stem_type = g.stem_type[:-len('_s2')]
 
     # R5-R7: single spatial-aware pass — kernel, downsample, pool budget, block compat.
     #
     # Tracks ACTUAL h/w at each stage after the chosen downsample op:
     #   • maxpool / avgpool  →  h = h // 2   (floor, PyTorch default)
     #   • stride2 (conv)     →  h = (h-1)//2 + 1 = (h+1)//2  (ceil on odd dims)
+    #   • anisotropic family →  pools halve ONLY the aniso axis (builder emits
+    #     (1,2)/(2,1) pools), so the tracking must too or every kernel clamp
+    #     downstream is computed against a phantom shrunken short axis.
     #
     # Key repair actions per stage:
-    #   a) stride2 on odd dim → replace with maxpool to keep floor semantics
+    #   a) anisotropic: stride2 → maxpool. Inside most blocks stride2 halves
+    #      BOTH axes while aniso pools halve only the long one — two different
+    #      semantics under one gene. Converting makes every downsample
+    #      axis-aware and the tracking below exact.
+    #   a2) stride2 on odd dim → replace with maxpool to keep floor semantics
     #      everywhere; avoids ceil/floor mismatch between main path and skip.
-    #   b) Enforce family.max_pool_steps budget.
+    #   b) Enforce family.max_pool_steps budget (a strided stem consumes one).
     #   c) Clamp kernel to fit current spatial (k < min(h,w)).
     #   d) Clamp dilation so effective receptive field fits spatial.
     #   e) Block-specific constraints (attention needs spatial > 1 in each dim).
+    aniso = family.aniso_axis if family.is_anisotropic else None
     h, w = H, W
     pool_steps = 0
+    if stem_stride(g.stem_type) == 2:   # survived R4b → input is large enough
+        h, w = max(1, (h + 1) // 2), max(1, (w + 1) // 2)
+        pool_steps = 1
     for stage in g.active_stages:
         ds = stage.downsample
 
-        # (a) stride2 with odd spatial → switch to maxpool (both give floor)
+        # (a) anisotropic: all downsampling must be axis-aware pooling
+        if aniso and ds == 'stride2':
+            ds = stage.downsample = 'maxpool'
+
+        # (a2) stride2 with odd spatial → switch to maxpool (both give floor)
         if ds == 'stride2' and (h % 2 != 0 or w % 2 != 0):
             ds = stage.downsample = 'maxpool'
 
@@ -190,8 +222,16 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
                 ds = stage.downsample = 'identity'
 
         # Compute post-downsample spatial for this stage's ops
-        sh = (h + 1) // 2 if ds == 'stride2' else (max(1, h // 2) if ds != 'identity' else h)
-        sw = (w + 1) // 2 if ds == 'stride2' else (max(1, w // 2) if ds != 'identity' else w)
+        if ds == 'identity':
+            sh, sw = h, w
+        elif aniso == 'W':
+            sh, sw = h, max(1, w // 2)
+        elif aniso == 'H':
+            sh, sw = max(1, h // 2), w
+        elif ds == 'stride2':
+            sh, sw = (h + 1) // 2, (w + 1) // 2
+        else:
+            sh, sw = max(1, h // 2), max(1, w // 2)
 
         # (c) kernel must be < min spatial dim (needs at least 1 pixel of output)
         k = KERNEL_LIST[stage.kernel_idx]
@@ -238,10 +278,11 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
 
     # R9 + R10 + R12: head compatibility — use actual final spatial dims,
     # accounting for neck which may collapse spatial independently of stages.
-    final_h, final_w = H, W
-    for stage in g.active_stages:
-        final_h = _actual_spatial(final_h, stage.downsample)
-        final_w = _actual_spatial(final_w, stage.downsample)
+    # compute_output_spatial is the SAME function the builder sizes heads with
+    # (stem-stride and aniso-axis aware), so repair and build can never differ.
+    # Exact here: after (a)/(a2) above, any surviving stride2 acts on even dims
+    # where its ceil semantics equal the pools' floor.
+    final_h, final_w = compute_output_spatial(g, H, W, aniso)
 
     # global_avg neck collapses spatial to 1×1 before the head
     eff_h = 1 if g.neck_type == 'global_avg' else final_h
@@ -272,7 +313,8 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
     from helpers import select_batch_size
     train_bs = select_batch_size(C, H, W)
     for _shrink in range(3):
-        mem_mb = estimate_activations_mb(g, C, H, W, batch_size=train_bs)
+        mem_mb = estimate_activations_mb(g, C, H, W, batch_size=train_bs,
+                                         aniso_axis=aniso)
         if mem_mb <= memory_budget_mb:
             break
         # Reduce expansion first (cheapest quality loss), then channels, then stages

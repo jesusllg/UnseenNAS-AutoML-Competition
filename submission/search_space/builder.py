@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import List, Tuple
 
 from .genotype import (
-    Genotype, StageGene,
+    Genotype, StageGene, stem_stride,
     CHANNEL_LIST, KERNEL_LIST, N_BLOCKS_LIST, EXPANSION_LIST,
     DILATION_LIST, SE_RATIO_LIST, DROPOUT_LIST, DROP_PATH_LIST,
     GROUP_W_LIST,
@@ -15,9 +15,10 @@ from .block_library import BLOCK_REGISTRY, make_norm, make_act
 
 def build_stem(stem_type: str, c_in: int, c_out: int,
                norm_type: str = 'batch', act_type: str = 'relu') -> nn.Module:
-    if stem_type == 'conv7x7':
+    stride = stem_stride(stem_type)
+    if stem_type in ('conv7x7', 'conv7x7_s2'):
         return nn.Sequential(
-            nn.Conv2d(c_in, c_out, 7, stride=1, padding=3, bias=False),
+            nn.Conv2d(c_in, c_out, 7, stride=stride, padding=3, bias=False),
             make_norm(c_out, norm_type),
             make_act(act_type),
         )
@@ -36,9 +37,9 @@ def build_stem(stem_type: str, c_in: int, c_out: int,
             make_norm(c_out, norm_type),
             make_act(act_type),
         )
-    else:  # 'conv3x3'
+    else:  # 'conv3x3' / 'conv3x3_s2'
         return nn.Sequential(
-            nn.Conv2d(c_in, c_out, 3, padding=1, bias=False),
+            nn.Conv2d(c_in, c_out, 3, stride=stride, padding=1, bias=False),
             make_norm(c_out, norm_type),
             make_act(act_type),
         )
@@ -182,13 +183,24 @@ HEAD_REGISTRY = {
 
 # ── Spatial size tracker ──────────────────────────────────────────────────────
 
-def compute_output_spatial(genotype: Genotype, H: int, W: int) -> Tuple[int, int]:
+def compute_output_spatial(genotype: Genotype, H: int, W: int,
+                           aniso_axis=None) -> Tuple[int, int]:
+    """
+    Final spatial dims after stem + stages. Must mirror what the built network
+    actually does: strided stems halve both axes; for anisotropic families the
+    per-stage downsamples halve ONLY the aniso axis (see build_downsample).
+    """
     h, w = H, W
-    for i, stage in enumerate(genotype.active_stages):
-        ds = stage.downsample
-        if ds == 'identity':
-            pass
-        else:  # stride2, maxpool, avgpool all halve spatial
+    if stem_stride(genotype.stem_type) == 2:
+        h, w = max(1, (h + 1) // 2), max(1, (w + 1) // 2)
+    for stage in genotype.active_stages:
+        if stage.downsample == 'identity':
+            continue
+        if aniso_axis == 'W':
+            w = max(1, w // 2)
+        elif aniso_axis == 'H':
+            h = max(1, h // 2)
+        else:  # stride2, maxpool, avgpool all halve both axes
             h = max(1, h // 2)
             w = max(1, w // 2)
     return h, w
@@ -335,7 +347,7 @@ def build_model(genotype: Genotype, C: int, H: int, W: int,
     if genotype.neck_type == 'global_avg':
         final_h, final_w = 1, 1
     else:
-        final_h, final_w = compute_output_spatial(genotype, H, W)
+        final_h, final_w = compute_output_spatial(genotype, H, W, aniso_axis)
 
     head_cls = HEAD_REGISTRY[genotype.head_type]
     head = head_cls(

@@ -1,5 +1,8 @@
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+from .genotype import MAX_STAGES
 
 
 @dataclass
@@ -35,17 +38,24 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
     # Example: Cryptic 1×6×768 → W is the "sequence" axis (BERT embeddings)
     if aniso_ratio >= 6.0 and spatial_min <= 8:
         axis = 'W' if W > H else 'H'
+        # Downsampling in this family only ever halves the LONG axis (builder
+        # emits (1,2)/(2,1) pools and repair converts stride2 → maxpool), so
+        # the pool budget is sized from the long axis — enough halvings to
+        # bring the sequence axis down to ~8-24, capped by the stage count.
+        # Sizing it from the short axis (as before) starved sequence data of
+        # hierarchy: 1×768 inputs got ZERO pools and ran full-width throughout.
+        pool_budget = min(MAX_STAGES, max(1, int(math.log2(max(spatial_max / 8, 2)))))
         return FamilyProfile(
             name            = 'anisotropic',
-            max_pool_steps  = min(2, int(spatial_min).bit_length() - 1),
+            max_pool_steps  = pool_budget,
             is_anisotropic  = True,
             aniso_axis      = axis,
-            enable_attention= False,     # even after max pooling, total spatial > 256
+            enable_attention= True,      # per-stage spatial guard in repair governs
             force_groupnorm = True,
             augment_hflip   = False,     # flipping W reverses embedding dim indices (meaningless)
             preferred_blocks= ['AnisotropicBlock', 'ChannelMixingBlock',
                                'GlobalContextBlock', 'ConvBlock'],
-            forbidden_blocks= ['LightAttentionBlock'],
+            forbidden_blocks= [],
         )
 
     # ── small_grid: tiny spatial (≤8×8), typically symbolic/board-like
@@ -66,7 +76,7 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
         return FamilyProfile(
             name            = 'possible_voxel',
             max_pool_steps  = 2,
-            enable_attention= spatial_area <= 256,
+            enable_attention= True,   # per-stage spatial guard in repair governs
             force_groupnorm = True,
             preferred_blocks= ['ResidualBlock', 'BottleneckBlock', 'ConvBlock'],
             forbidden_blocks= ['AnisotropicBlock'],
@@ -78,7 +88,7 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
         return FamilyProfile(
             name            = 'channel_heavy',
             max_pool_steps  = 2,
-            enable_attention= spatial_area <= 256,
+            enable_attention= True,   # per-stage spatial guard in repair governs
             force_groupnorm = C % 8 == 0,
             preferred_blocks= ['ChannelMixingBlock', 'MBConvBlock', 'BottleneckBlock', 'ResidualBlock'],
             forbidden_blocks= ['AnisotropicBlock'],
@@ -128,10 +138,14 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
         )
 
     # ── compact_general: everything else (small but not tiny)
+    # A family-level attention ban keyed on INPUT area was too blunt here: e.g.
+    # Gutenberg 27×18 (area 486) blocked attention everywhere, yet after one
+    # pool the map is 13×9 = 117 tokens — exactly what the per-stage guard in
+    # repair exists to allow. Defer to it, like visual_large always did.
     return FamilyProfile(
         name            = 'compact_general',
         max_pool_steps  = 2,
-        enable_attention= spatial_area <= 256,
+        enable_attention= True,   # per-stage spatial guard in repair governs
         force_groupnorm = False,
         preferred_blocks= ['ConvBlock', 'ResidualBlock', 'SepConvBlock',
                            'GlobalContextBlock', 'DilatedConvBlock'],

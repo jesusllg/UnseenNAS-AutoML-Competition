@@ -528,9 +528,15 @@ HEAD_TYPES = [
     'FlattenMlp', 'AttentionPool', 'SpatialPyramidPool', 'GatedPool',
 ]   # 7 heads
 
-STEM_TYPES = ['conv3x3', 'conv7x7', 'conv1x1', 'double_conv']   # 4 stem types
+STEM_TYPES = ['conv3x3', 'conv7x7', 'conv1x1', 'double_conv',
+              'conv3x3_s2', 'conv7x7_s2']   # 6 stem types (_s2 = stride-2)
 NECK_TYPES = ['none', 'conv1x1', 'global_avg']                   # 3 neck types
 ```
+
+The `_s2` stems halve H and W at the entrance — cheap early compute for
+high-resolution inputs. Repair demotes them to their stride-1 twin when
+`min(H,W) < 32` or the family is anisotropic, and a strided stem consumes one
+step of the family's pool budget.
 
 `act_type` and `norm_type` are **global** genes (one activation / one norm for the
 whole network); everything else is per-stage. Both are searched (`silu`/`gelu` are
@@ -563,14 +569,20 @@ first match wins:
 
 | Family | Trigger condition | Max pool steps | Force GroupNorm | Notes |
 |---|---|---|---|---|
-| `anisotropic` | ratio ≥ 6 **and** min(H,W) ≤ 8 | `min(2, log2(min))` | Yes | attention off; hflip off (axis is sequential) |
+| `anisotropic` | ratio ≥ 6 **and** min(H,W) ≤ 8 | `min(5, log2(max/8))` — sized from the LONG axis | Yes | pools halve only the long axis; stride2 → maxpool; hflip off (axis is sequential) |
 | `small_grid` | max(H,W) ≤ 10 | 1 | Yes | board/symbolic grids |
-| `possible_voxel` | H≈W≈C cube, area ≤ 625 | 2 | Yes | attention only if area ≤ 256 |
-| `channel_heavy` | C ≥ 8, area ≤ 1024 | 2 | if C%8==0 | attention only if area ≤ 256 |
+| `possible_voxel` | H≈W≈C cube, area ≤ 625 | 2 | Yes | attention gated per-stage |
+| `channel_heavy` | C ≥ 8, area ≤ 1024 | 2 | if C%8==0 | attention gated per-stage |
 | `spatiotemporal_like` | C ≥ 3, H=1 or W=1, max ≥ 32 | 3 | No | aniso axis set |
-| `visual_large` | min(H,W) ≥ 64 | 4 if min<128 else 5 | No | per-stage attention guard |
+| `visual_large` | min(H,W) ≥ 64 | 4 if min<128 else 5 | No | attention gated per-stage |
 | `visual_medium` | min(H,W) ≥ 24 | 3 | No | |
-| `compact_general` | everything else | 2 | No | attention only if area ≤ 256 |
+| `compact_general` | everything else | 2 | No | attention gated per-stage |
+
+Attention is governed by ONE rule everywhere: the per-stage spatial guard in
+`repair.py` (a `LightAttentionBlock` needs the stage's actual map to be ≤ 256
+tokens and > 1 pixel per axis). No family bans it globally any more — e.g.
+Gutenberg-shaped 27×18 inputs (area 486) now get attention in deep stages,
+where the map has shrunk to 13×9 = 117 tokens.
 
 `augment_hflip` is a family field consumed by `DataProcessor`; only `anisotropic`
 disables it (flipping a sequential axis destroys positional meaning). To adjust any
@@ -688,7 +700,7 @@ CORR_N_EPOCHS = 1    # Section 7: 1 epoch per arch instead of 3
 
 ## 10. Search space reference
 
-### 10.1 The 11 primitive blocks
+### 10.1 The 12 primitive blocks
 
 | Block | Best for | Key parameters |
 |---|---|---|
@@ -702,7 +714,8 @@ CORR_N_EPOCHS = 1    # Section 7: 1 epoch per arch instead of 3
 | `GridLogicBlock` | Rule-based grids (Sudoku, Game of Life) | kernel |
 | `ChannelMixingBlock` | Many-channel inputs | expansion |
 | `GlobalContextBlock` | Broadcast global context as channel bias | — |
-| `LightAttentionBlock` | Small spatial dims (H×W ≤ 256) | — |
+| `LightAttentionBlock` | Small spatial dims (H×W ≤ 256, gated per-stage) | — |
+| `GroupedBottleneckBlock` | RegNetX-style grouped convolutions | group width |
 
 ### 10.2 The 7 head types
 
@@ -720,7 +733,7 @@ CORR_N_EPOCHS = 1    # Section 7: 1 epoch per arch instead of 3
 
 | Family | When triggered | Main effect |
 |---|---|---|
-| `anisotropic` | max(H,W)/min(H,W) ≥ 6 | Factored blocks, ≤2 pool steps, GroupNorm |
+| `anisotropic` | max(H,W)/min(H,W) ≥ 6, min ≤ 8 | Factored blocks, long-axis-only pooling (up to 5 steps), GroupNorm |
 | `small_grid` | max(H,W) ≤ 10 | ≤1 pool step, GroupNorm, attention allowed |
 | `possible_voxel` | H≈W≈C, area≤1024 | ≤2 pool steps, GroupNorm |
 | `channel_heavy` | C≥8, area≤1024 | Channel mixing preferred, ≤2 pool steps |
@@ -733,15 +746,15 @@ CORR_N_EPOCHS = 1    # Section 7: 1 epoch per arch instead of 3
 
 1. Clamp `n_stages` to [1, MAX_STAGES]
 2. Override norm to GroupNorm if `family.force_groupnorm`
-3. Replace forbidden blocks with random allowed alternatives
-4. Gate LightAttentionBlock: only if spatial area ≤ 256
-5. Clip kernel size: never larger than min(H,W) after all pooling
-6. Cap total pooling steps to `family.max_pool_steps`
-7. Fix anisotropic axis consistency across all stages
+3. Replace family-forbidden blocks with `ConvBlock`
+4. Family-level attention ban (rare — the per-stage guard in rule 7 is the normal gate)
+5. Demote strided stems (`*_s2`) to stride-1 when `min(H,W) < 32` or the family is anisotropic
+6. Anisotropic: convert `stride2` → `maxpool` so every downsample halves only the long axis (matching the builder)
+7. Spatial-aware pass tracking the ACTUAL per-stage map (stem stride and aniso axis included): enforce the pool budget (a strided stem consumes one step), clamp kernel and dilation to the current map, gate `LightAttentionBlock` per stage (≤ 256 tokens, > 1 px per axis)
 8. Enforce monotone (non-decreasing) channel progression across stages
 9. Kill FlattenMlp if flattened dim > 65536
-10. Kill SpatialPyramidPool if final H or W < 4
-11. Memory budget guard: reduce channels if estimated activation MB > budget
+10. Kill SpatialPyramidPool if final H or W < 4; kill heads that degenerate under a `global_avg` neck
+11. Memory budget guard (stem/aniso-aware estimator): reduce expansion → channels → stages if estimated MB > ~80% of the GPU
 
 ---
 

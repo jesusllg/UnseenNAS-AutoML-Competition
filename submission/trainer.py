@@ -172,8 +172,18 @@ class Trainer:
             t0 = time.perf_counter()
             self.model.train()
             labels, preds = [], []
+            hit_deadline = False
 
             for x, y in self.train_dl:
+                # Mid-epoch deadline check. The average-epoch-time guard above
+                # cannot protect the FIRST epoch (no history yet), and a single
+                # epoch of a heavy dataset can exceed the whole training budget
+                # — overrunning the organiser's clock fails the dataset (-10).
+                # This bounds the overrun to one batch instead of one epoch;
+                # the optimizer steps taken so far still count.
+                if time.perf_counter() >= deadline:
+                    hit_deadline = True
+                    break
                 x, y = x.to(self.device), y.to(self.device)
 
                 out = self._forward_backward(x, y, optimizer, criterion,
@@ -188,6 +198,11 @@ class Trainer:
             scheduler.step()
             epoch += 1
             epoch_times.append(time.perf_counter() - t0)
+
+            if hit_deadline:
+                print(f"  Time limit hit mid-epoch {epoch} — stopping with "
+                      f"{'best' if best_state is not None else 'current'} weights.")
+                break
 
             train_acc = accuracy_score(labels, preds)
             val_acc   = self._evaluate(self.valid_dl)
@@ -214,11 +229,16 @@ class Trainer:
         if best_state is not None:
             self.model.load_state_dict(best_state)
             print(f"  ← Restored best weights from epoch {best_epoch} (val={best_acc*100:.2f}%)")
+            # Re-evaluating the restored weights would reproduce best_acc by
+            # construction (eval is deterministic) — don't spend a valid pass.
+            final_val_acc = best_acc
+        elif self.clock.check() - self._reserve_s > 0:
+            final_val_acc = self._evaluate(self.valid_dl)
+        else:
+            final_val_acc = 0.0   # no time left to measure — predict still runs
 
-        # Final evaluation with best weights. The valid set is small — always
-        # re-evaluate. The full train-set pass is diagnostic only; skip it when
-        # it could eat into the predict reserve (cost ≈ one epoch's forward).
-        final_val_acc = self._evaluate(self.valid_dl)
+        # The full train-set pass is diagnostic only; skip it when it could eat
+        # into the predict reserve (cost ≈ one epoch's forward).
         train_eval_cost = epoch_times[-1] if epoch_times else 0.0
         if self.clock.check() - self._reserve_s > train_eval_cost:
             final_train_acc = self._evaluate(self.train_dl)
@@ -232,7 +252,11 @@ class Trainer:
 
         train_elapsed = time.perf_counter() - t_train_start
         self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
-        self._save_model()
+        # Model save is diagnostics only — never let it eat into predict time.
+        if self.clock.check() > self._reserve_s * 0.5:
+            self._save_model()
+        else:
+            print("  (skipped model save — protecting predict reserve)")
 
         return self.model
 
