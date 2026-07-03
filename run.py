@@ -14,12 +14,14 @@ Usage:
   python run.py --truncate              # quick smoke-test (64 samples)
 
 Time budget modes (mutually exclusive):
+  (default)           Mirror the official evaluator: each dataset gets its own
+                      clock from the metadata `time_limit` field (hours),
+                      falling back to 0.5 h when absent — exactly like
+                      evaluation/main.py.
   --time HOURS        Fixed per-dataset time limit (overrides metadata).
-  --total-time HOURS  Global pool with halving allocation: each dataset gets
-                      pool/2 (the last one gets everything left), floored at
-                      --min-time. Saved time flows to the remaining datasets.
-  (default)           Same halving policy via the GlobalBudgetGovernor with
-                      the competition constants (24h total, 3 datasets).
+  --total-time HOURS  LOCAL-ONLY convenience: a global pool with halving
+                      allocation (each dataset gets pool/2, the last one gets
+                      everything left), floored at --min-time.
 
 Datasets always run cheapest→heaviest so surplus time reaches the heavy ones.
 """
@@ -42,8 +44,10 @@ from nas import NAS
 from data_processor import DataProcessor
 from trainer import Trainer
 from helpers import (show_time, load_metadata, estimate_dataset_cost,
-                     halving_allocation, GlobalBudgetGovernor,
-                     N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS)
+                     halving_allocation)
+
+# Official evaluator default when a dataset's metadata lacks `time_limit`
+DEFAULT_TIME_LIMIT_H = 0.5
 
 
 # ── helpers (mirrors evaluation/main.py) ─────────────────────────────────────
@@ -59,10 +63,8 @@ class Clock:
 class GlobalTimeBudget:
     """
     Dynamically redistributes a total time pool across datasets (--total-time).
-
-    Allocation policy is helpers.halving_allocation — the same single source
-    of truth the GlobalBudgetGovernor uses, so the local clock can never be
-    smaller than the GBG's internal allocation.
+    Local-testing convenience only — the official 2026 evaluator gives every
+    dataset its own fixed clock from its metadata `time_limit`.
     """
 
     def __init__(self, total_hours, n_datasets, min_hours=0.1):
@@ -189,7 +191,8 @@ def main():
                     help="Dataset folder name(s) to run. Default: all in datasets/.")
     ap.add_argument("--time", type=float, metavar="HOURS",
                     help="Fixed time limit per dataset (hours). "
-                         "Default: use metadata field, fallback 7h.")
+                         "Default: metadata `time_limit`, fallback "
+                         f"{DEFAULT_TIME_LIMIT_H}h (same as the official evaluator).")
     ap.add_argument("--total-time", type=float, metavar="HOURS",
                     help="Global time pool (hours) shared across all datasets. "
                          "Unused time flows to remaining datasets. "
@@ -209,10 +212,6 @@ def main():
     datasets_dir = Path(args.datasets_dir)
     pred_dir     = Path("predictions")
     pred_dir.mkdir(exist_ok=True)
-
-    # Reset GBG state at the start of every run.py invocation so a previously
-    # killed or partial test run doesn't leave stale n_done counts behind.
-    GlobalBudgetGovernor.reset_state()
 
     if not datasets_dir.exists():
         print(f"ERROR: datasets directory not found: {datasets_dir}")
@@ -250,11 +249,9 @@ def main():
         print(f"Running all {n_ds}: {[p.name for p in targets]}")
 
     # ── Order datasets cheapest→heaviest (ALL modes) ──────────────────────────
-    # Easy/fast datasets must run first so their unused time flows to the heavy
-    # ones at the end (GBG halving gives the last dataset the entire remaining
-    # pool). Previously this sort only ran with --total-time, so in default mode
-    # the order was alphabetical and a heavy dataset like CIFARTile could run
-    # first and starve everything after it.
+    # With per-dataset clocks the order doesn't change any budget, but in
+    # --total-time mode surplus time flows to whoever runs later, and in all
+    # modes it means quick feedback arrives first during local testing.
     costs = {}
     for p in targets:
         try:
@@ -285,22 +282,21 @@ def main():
 
     results = {}
     for ds_path in targets:
-        # Determine the local clock for this dataset. In every mode the clock
-        # must be >= the GBG's internal allocation, otherwise min(clock, GBG)
-        # collapses to the clock and the GBG never controls anything. Both
-        # GlobalTimeBudget and GlobalBudgetGovernor use helpers.halving_allocation,
-        # so they always agree by construction.
+        # Determine this dataset's clock, mirroring the official evaluator:
+        # metadata `time_limit` (hours), fallback 0.5 h. --time/--total-time
+        # are local-testing overrides.
         if budget is not None:
             hours = budget.next_allocation_h()
         elif args.time is not None:
             hours = args.time
         else:
-            # Default mode: read the same persisted GBG state NAS will read,
-            # so the clock equals the GBG allocation exactly.
-            hours = GlobalBudgetGovernor(
-                n_total=N_COMPETITION_DATASETS,
-                total_hours=TOTAL_COMPETITION_HOURS,
-            ).get_allocation() / 3600
+            meta_limit = load_metadata(ds_path).get("time_limit")
+            if meta_limit is None:
+                print(f"NOTE: {ds_path.name} metadata has no `time_limit` — "
+                      f"using the official default of {DEFAULT_TIME_LIMIT_H}h.")
+                hours = DEFAULT_TIME_LIMIT_H
+            else:
+                hours = float(meta_limit)
 
         ok, runtime = run_one(ds_path, args, pred_dir, hours)
         results[ds_path.name] = ok

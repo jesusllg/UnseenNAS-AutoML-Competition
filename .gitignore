@@ -7,3 +7,9 @@ build/
 *.npy
 predictions/
 datasets/
+
+# Local evaluation staging (created by the Makefile)
+package/
+scoring/
+final_results.json
+submission.zip

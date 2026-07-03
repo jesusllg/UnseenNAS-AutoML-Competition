@@ -7,9 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from helpers import (show_time, set_seeds, GLOBAL_SEED, free_gpu,
-                     GlobalBudgetGovernor,
-                     N_COMPETITION_DATASETS, TOTAL_COMPETITION_HOURS)
+from helpers import show_time, set_seeds, GLOBAL_SEED, free_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -116,17 +114,6 @@ class NAS:
         # Release any GPU memory the previous dataset may have left behind
         free_gpu()
 
-        # ── Global Budget Governor ────────────────────────────────────────────
-        # The governor owns the whole budget lifecycle (allocation, wall clock,
-        # usage recording). It is handed to Trainer through the in-memory
-        # metadata dict under ONE key — never written to any dataset file.
-        self._gbg = GlobalBudgetGovernor(
-            n_total     = metadata.get('n_competition_datasets', N_COMPETITION_DATASETS),
-            total_hours = metadata.get('total_competition_hours', TOTAL_COMPETITION_HOURS),
-        )
-        self._gbg.begin_dataset(metadata.get('codename', 'unknown'))
-        metadata['_gbg'] = self._gbg
-
     def search(self):
         try:
             return self._search()
@@ -151,8 +138,9 @@ class NAS:
         n_rounds    = NAS_ROUNDS
         tourney_k   = NAS_TOURNAMENT
         search_frac = SEARCH_FRAC
-        # Cap search to our effective per-dataset budget, not just clock remaining
-        search_budget = min(self.clock.check(), self._gbg.current_allocation()) * search_frac
+        # The organiser's per-dataset clock is the single time authority (2026
+        # model: each dataset gets its own fixed clock, no cross-dataset pool).
+        search_budget = self.clock.check() * search_frac
         t_search_start = time.perf_counter()
         print(f"  NAS | sf={search_frac:.2f} → budget={show_time(search_budget)}"
               f"  pop={n_pop} rounds={n_rounds} | device={self.device}")

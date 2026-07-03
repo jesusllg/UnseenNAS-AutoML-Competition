@@ -9,11 +9,9 @@ import numpy as np
 import torch
 
 
-# Reproducibility + competition facts live in config.py (the single source of
-# truth). Re-exported here so existing `from helpers import GLOBAL_SEED` etc.
-# keep working unchanged.
-from config import (GLOBAL_SEED, N_COMPETITION_DATASETS,
-                    TOTAL_COMPETITION_HOURS, COMPETITION_OVERHEAD_HOURS)
+# Reproducibility lives in config.py (the single source of truth).
+# Re-exported here so existing `from helpers import GLOBAL_SEED` keeps working.
+from config import GLOBAL_SEED
 
 _FAMILY_COST_WEIGHT = {
     'small_grid':          0.40,
@@ -150,7 +148,9 @@ def estimate_dataset_cost(meta: dict, dataset_dir=None) -> float:
 
 def halving_allocation(pool_s: float, n_remaining: int) -> float:
     """
-    THE time-allocation policy. Everything that allocates time calls this.
+    Halving time-allocation policy for LOCAL --total-time test runs only.
+    (The official 2026 evaluator gives each dataset its own fixed clock, so
+    nothing in the submission itself allocates across datasets.)
 
       - last dataset  → entire remaining pool (inherits all unused time)
       - otherwise     → half the remaining pool
@@ -159,123 +159,3 @@ def halving_allocation(pool_s: float, n_remaining: int) -> float:
     if n_remaining <= 1:
         return pool_s
     return pool_s / 2
-
-
-class GlobalBudgetGovernor:
-    """
-    Owns the entire per-dataset time-budget lifecycle. Persists cumulative
-    usage across datasets in predictions/.global_budget.json so the allocation
-    survives the organizer creating a fresh Clock per dataset.
-
-    Lifecycle (the ONLY contract between NAS and Trainer is this object,
-    handed over in-memory as metadata['_gbg'] — never written to disk):
-
-        gbg = GlobalBudgetGovernor(...)
-        gbg.begin_dataset(codename)      # NAS.__init__: start wall clock, fix allocation
-        gbg.allocation_s                 # NAS search: full allocation for this dataset
-        gbg.effective_remaining()        # Trainer: allocation minus elapsed wall time
-        gbg.finish_dataset()             # Trainer finally: record usage (idempotent)
-
-    Never writes to any datasets/*/metadata file.
-    """
-
-    _STATE_FILE = Path("predictions") / ".global_budget.json"
-
-    def __init__(self, n_total: int = N_COMPETITION_DATASETS,
-                 total_hours: float = TOTAL_COMPETITION_HOURS,
-                 overhead_hours: float = COMPETITION_OVERHEAD_HOURS):
-        self.n_total      = n_total
-        self.pool_s       = (total_hours - overhead_hours) * 3600
-        self._state       = self._load()
-        self._wall_start  = None   # set by begin_dataset()
-        self.allocation_s = None   # set by begin_dataset()
-        self._done        = False  # finish_dataset() idempotency guard
-
-    # ── persistence ───────────────────────────────────────────────────────────
-
-    def _load(self) -> dict:
-        try:
-            if self._STATE_FILE.exists():
-                state = json.loads(self._STATE_FILE.read_text())
-                # Auto-reset when a previous full run completed so the next run starts clean
-                if state.get('n_done', 0) >= self.n_total:
-                    return {'n_done': 0, 'seconds_used': 0.0}
-                return state
-        except Exception:
-            pass
-        return {'n_done': 0, 'seconds_used': 0.0}
-
-    def _save(self):
-        self._STATE_FILE.parent.mkdir(exist_ok=True)
-        self._STATE_FILE.write_text(json.dumps(self._state, indent=2))
-
-    @classmethod
-    def reset_state(cls):
-        """Delete the persisted state file (fresh local test run)."""
-        if cls._STATE_FILE.exists():
-            cls._STATE_FILE.unlink()
-            print("  [GBG] Cleared stale state file — fresh run.")
-
-    # ── allocation ────────────────────────────────────────────────────────────
-
-    def get_allocation(self) -> float:
-        """Seconds this dataset should consume, per the halving policy."""
-        n_done       = self._state.get('n_done', 0)
-        seconds_used = self._state.get('seconds_used', 0.0)
-        remaining    = max(0.0, self.pool_s - seconds_used)
-        n_remaining  = max(1, self.n_total - n_done)
-
-        alloc = halving_allocation(remaining, n_remaining)
-        tag   = "last dataset → full pool" if n_remaining == 1 else "halving"
-        print(f"  [GBG] {tag} alloc={alloc/3600:.2f}h"
-              f"  (pool={remaining/3600:.2f}h, done={n_done}/{self.n_total})")
-        return alloc
-
-    # ── lifecycle ─────────────────────────────────────────────────────────────
-
-    def begin_dataset(self, dataset_name: str = '') -> float:
-        """Fix this dataset's allocation and start its wall clock."""
-        self._wall_start  = time.perf_counter()
-        self.allocation_s = self.get_allocation()
-        self._state['current'] = dataset_name
-        self._save()
-        return self.allocation_s
-
-    def current_allocation(self) -> float:
-        """
-        This dataset's allocation in seconds. Computes it on demand if
-        begin_dataset() hasn't run yet, so callers can never read a None
-        allocation (defensive — normal flow sets it in begin_dataset()).
-        """
-        if self.allocation_s is None:
-            self.allocation_s = self.get_allocation()
-        return self.allocation_s
-
-    def elapsed(self) -> float:
-        """Wall seconds since begin_dataset() (0 if not begun)."""
-        if self._wall_start is None:
-            return 0.0
-        return time.perf_counter() - self._wall_start
-
-    def effective_remaining(self) -> float:
-        """Allocation minus elapsed wall time — what's truly left for this dataset."""
-        if self.allocation_s is None:
-            return self.pool_s
-        return max(0.0, self.allocation_s - self.elapsed())
-
-    def finish_dataset(self):
-        """Record this dataset's actual usage. Safe to call more than once."""
-        if self._done:
-            return
-        self._done = True
-        seconds_actual = self.elapsed()
-        self._state['n_done']       = self._state.get('n_done', 0) + 1
-        self._state['seconds_used'] = self._state.get('seconds_used', 0.0) + seconds_actual
-        self._save()
-        n_remaining = max(0, self.n_total - self._state['n_done'])
-        pool_left   = max(0.0, self.pool_s - self._state['seconds_used'])
-        carry       = pool_left / max(1, n_remaining)
-        print(f"  [GBG] done={self._state['n_done']}/{self.n_total}"
-              f"  used={show_time(seconds_actual)}"
-              f"  pool_left={show_time(pool_left)}"
-              f"  ~{show_time(carry)}/dataset")

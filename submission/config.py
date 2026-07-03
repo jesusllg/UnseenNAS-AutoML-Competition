@@ -25,19 +25,24 @@ hardcode per-dataset choices, because the real datasets are unseen.
 GLOBAL_SEED = 42
 
 
-# ── Competition facts (given by the organisers, not tuning knobs) ─────────────
+# ── Time budget (per-dataset, 2026 competition model) ─────────────────────────
+# The organiser's evaluator gives EACH dataset its own clock, sized from the
+# dataset's `time_limit` metadata field (default 0.5 h when absent). Time does
+# NOT carry over between datasets, and exceeding a dataset's clock fails that
+# dataset. So all budgeting below is a fraction of the clock the organiser
+# hands us — there is no global pool.
 
-N_COMPETITION_DATASETS     = 3     # known: 3 datasets
-TOTAL_COMPETITION_HOURS    = 24.0  # known: 24h total budget
-COMPETITION_OVERHEAD_HOURS = 0.5   # safety margin for I/O, imports, scoring
+SEARCH_FRAC = 0.30   # NAS search: fraction of the clock remaining at NAS start
 
-
-# ── Time-budget split ─────────────────────────────────────────────────────────
-# Fractions of the TOTAL per-dataset clock budget (not of remaining time).
-# search + train should sum to ≤ 0.95, leaving ~5% for predict/overhead.
-
-SEARCH_FRAC = 0.30   # NAS search phase
-TRAIN_FRAC  = 0.65   # final training phase
+# Training runs until the clock minus a reserve kept back for prediction and
+# artifact saving. The reserve is a fraction of the time remaining when
+# training starts, with an absolute floor so normal clocks always leave room
+# to predict — but capped at a fraction of the remaining time so that on very
+# short clocks the floor can never swallow the whole training budget.
+# Failing to predict scores -10; a slightly shorter training run costs far less.
+PREDICT_RESERVE_FRAC     = 0.07   # of clock remaining at training start
+PREDICT_RESERVE_MIN_S    = 90.0   # absolute floor (seconds)
+PREDICT_RESERVE_MAX_FRAC = 0.25   # ceiling: reserve never exceeds this share
 
 
 # ── NAS search (aging evolution) ──────────────────────────────────────────────

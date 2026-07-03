@@ -15,7 +15,8 @@ from helpers import show_time, set_seeds, GLOBAL_SEED, free_gpu
 
 # Pipeline hyperparameters: single source of truth in config.py.
 from config import (
-    SEARCH_FRAC, TRAIN_FRAC, WEIGHT_DECAY,
+    PREDICT_RESERVE_FRAC, PREDICT_RESERVE_MIN_S, PREDICT_RESERVE_MAX_FRAC,
+    WEIGHT_DECAY,
     LEARNING_RATE, GRAD_CLIP_NORM, LR_T_MAX, LR_ETA_MIN,
     LABEL_SMOOTHING, LABEL_SMOOTHING_MIN_CLASSES,
     ES_ENABLED, ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
@@ -102,12 +103,6 @@ class Trainer:
             print("  [Trainer] Unexpected error — returning model as-is.")
             print(traceback.format_exc())
             return self.model
-        finally:
-            # Always notify GBG of completion, even on failure, so state stays
-            # consistent for the next dataset. finish_dataset() is idempotent.
-            gbg = self.metadata.get('_gbg')
-            if gbg is not None:
-                gbg.finish_dataset()
 
     def _train(self):
         set_seeds(GLOBAL_SEED)
@@ -117,18 +112,17 @@ class Trainer:
 
         weight_decay = WEIGHT_DECAY
 
-        # Training budget. SEARCH_FRAC / TRAIN_FRAC are complementary fractions of
-        # the TOTAL per-dataset clock; the GBG already knows how much NAS consumed.
-        gbg = self.metadata.get('_gbg')
-        if gbg is not None:
-            # GBG is active: training gets everything left of the allocated budget.
-            # effective_remaining() already accounts for NAS time, so no fraction
-            # needed. clock.check() is the hard ceiling (organizer's clock).
-            train_budget = min(self.clock.check(), gbg.effective_remaining())
-        else:
-            # Legacy fallback when GBG is not available: estimate from fractions.
-            remaining_frac = max(1.0 - SEARCH_FRAC, 1e-6)
-            train_budget   = self.clock.check() * (TRAIN_FRAC / remaining_frac)
+        # Training budget: everything left on the organiser's per-dataset clock
+        # minus a reserve held back for prediction + artifact saving. A missed
+        # predict scores -10; a slightly shorter training run costs far less.
+        # The floor covers save+predict on normal clocks; the MAX_FRAC ceiling
+        # keeps the floor from swallowing the whole budget on very short clocks.
+        remaining = self.clock.check()
+        self._reserve_s = min(
+            max(PREDICT_RESERVE_MIN_S, remaining * PREDICT_RESERVE_FRAC),
+            remaining * PREDICT_RESERVE_MAX_FRAC,
+        )
+        train_budget = max(0.0, remaining - self._reserve_s)
         deadline = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 
@@ -142,8 +136,9 @@ class Trainer:
 
         es_desc = (f"δ↑{ES_DELTA_START:.4f}↘{ES_DELTA_MIN:.4f}/{ES_DELTA_DECAY} "
                    f"↓{ES_REGRESSION_DELTA:.4f} p={ES_PATIENCE}/~{ES_PLATEAU_PATIENCE}") if ES_ENABLED else "off"
-        print(f"  Trainer | budget={show_time(train_budget)} wd={weight_decay:.0e}"
-              f" | ES={es_desc} | device={self.device}")
+        print(f"  Trainer | budget={show_time(train_budget)}"
+              f" (predict reserve {show_time(self._reserve_s)})"
+              f" wd={weight_decay:.0e} | ES={es_desc} | device={self.device}")
 
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         optimizer = optim.AdamW(self.model.parameters(), lr=LEARNING_RATE, weight_decay=weight_decay)
@@ -157,6 +152,7 @@ class Trainer:
         best_state = None
         epoch_times: list[float] = []
         epoch = 0
+        train_acc = 0.0   # last observed train accuracy (fallback for the report)
         # Adaptive micro-batch: None = use the full batch. On OOM we halve it and
         # accumulate gradients so the EFFECTIVE batch size never changes. Persists
         # across epochs so we don't re-discover the limit every epoch.
@@ -219,9 +215,16 @@ class Trainer:
             self.model.load_state_dict(best_state)
             print(f"  ← Restored best weights from epoch {best_epoch} (val={best_acc*100:.2f}%)")
 
-        # Final evaluation with best weights
-        final_val_acc   = self._evaluate(self.valid_dl)
-        final_train_acc = self._evaluate(self.train_dl)
+        # Final evaluation with best weights. The valid set is small — always
+        # re-evaluate. The full train-set pass is diagnostic only; skip it when
+        # it could eat into the predict reserve (cost ≈ one epoch's forward).
+        final_val_acc = self._evaluate(self.valid_dl)
+        train_eval_cost = epoch_times[-1] if epoch_times else 0.0
+        if self.clock.check() - self._reserve_s > train_eval_cost:
+            final_train_acc = self._evaluate(self.train_dl)
+        else:
+            final_train_acc = train_acc
+            print("  (skipped final train-set eval — protecting predict reserve)")
         print(f"  {'─'*55}")
         print(f"  Final | Train {final_train_acc*100:.2f}% | Val {final_val_acc*100:.2f}%"
               f"  (best epoch: {best_epoch})")

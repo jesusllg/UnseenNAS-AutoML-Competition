@@ -41,31 +41,38 @@ The key insight: AZ-NAS scores thousands of architectures on a single mini-batch
 UnseenNAS-AutoML-Competition/
 │
 ├── submission/                   # The actual submission (what gets evaluated)
+│   ├── config.py                 # Single source of truth for every pipeline hyperparameter
 │   ├── data_processor.py         # Normalisation + adaptive augmentation
 │   ├── nas.py                    # NAS entry point: search + fallback
 │   ├── trainer.py                # Training loop (AdamW + cosine LR + AMP)
-│   ├── helpers.py                # Shared utilities (show_time, etc.)
+│   ├── helpers.py                # Shared utilities (show_time, batch-size rule, metadata I/O)
+│   ├── arch_viz.py               # PNG diagram of the found architecture
 │   └── search_space/             # The NAS engine
 │       ├── __init__.py           # Public API — import from here
 │       ├── genotype.py           # Architecture genome: dataclasses + mutation
 │       ├── family.py             # Geometry → hard constraints (infer_family)
-│       ├── block_library.py      # 11 primitive neural blocks + SEBlock + DropPath
+│       ├── block_library.py      # 12 primitive neural blocks + SEBlock + DropPath
 │       ├── builder.py            # Genome → nn.Module decoder
 │       ├── repair.py             # Deterministic constraint repair (11 rules)
 │       ├── proxies.py            # AZ-NAS zero-cost fitness proxy
 │       └── evolution.py          # Aging Evolution search loop
 │
-├── evaluation/                   # Competition evaluation pipeline
+├── evaluation/                   # Local copy of the organisers' evaluation pipeline
 │   ├── main.py                   # Runs DataProcessor → NAS → Trainer → predict
 │   └── score.py                  # Scores predictions vs ground-truth labels
 │
 ├── notebooks/
-│   └── nas_experiment.ipynb      # Paper-quality experiment notebook (9 sections)
+│   ├── nas_experiment.ipynb      # Paper-quality experiment notebook (9 sections)
+│   └── colab_tpu_pipeline.ipynb  # Colab/TPU end-to-end pipeline runner
+│
+├── paper/                        # LaTeX write-up
 │
 ├── datasets/                     # Put downloaded datasets here (git-ignored)
 │
+├── run.py                        # Local runner mirroring the official evaluator + conveniences
 ├── Makefile                      # Convenience targets: build / run / score / zip / all
 ├── download_datasets.py          # Download all 13 practice datasets
+├── requirements.txt              # torch / torchvision / scikit-learn / numpy
 └── README.md                     # This file
 ```
 
@@ -252,23 +259,22 @@ make submission=submission zip     # Create submission.zip for upload
 
 ### 5.4 Run manually (without Makefile)
 
+The official `evaluation/main.py` takes **no arguments** — it iterates every
+folder in `datasets/`, reading each dataset's clock from its metadata
+`time_limit` (hours). The Makefile stages it into `package/` and runs it there.
+For day-to-day local work use `run.py`, which mirrors the evaluator exactly in
+default mode and adds conveniences:
+
 ```bash
-cd evaluation
-python main.py \
-    --submission_dir ../submission \
-    --datasets_dir   ../datasets \
-    --output_dir     ../predictions \
-    --time_limit     1200          # 20 minutes per dataset (in seconds)
+python run.py                          # all datasets, official time model
+python run.py --time 0.33              # override: 20 minutes per dataset
+python run.py --truncate               # 64-sample smoke test
 ```
 
 ### 5.5 Run on a single dataset
 
 ```bash
-python evaluation/main.py \
-    --submission_dir submission \
-    --datasets_dir   datasets/CIFARTile \
-    --output_dir     predictions \
-    --time_limit     300           # 5 minutes — quick test
+python run.py --dataset CIFARTile --time 0.08   # one dataset, ~5 minutes
 ```
 
 ---
@@ -428,8 +434,10 @@ is duplicated across modules. To tune the pipeline, edit `config.py` and nothing
 | Constant | Default | Effect |
 |---|---|---|
 | `GLOBAL_SEED` | 42 | Seed for all RNG (search, shuffling, weight init). |
-| `SEARCH_FRAC` | 0.30 | Fraction of the per-dataset budget spent on NAS search. |
-| `TRAIN_FRAC` | 0.65 | Fraction spent on final training (rest is predict/overhead). |
+| `SEARCH_FRAC` | 0.30 | Fraction of the clock remaining at NAS start spent on search. |
+| `PREDICT_RESERVE_FRAC` | 0.07 | Fraction of the clock at training start reserved for predict + saving. |
+| `PREDICT_RESERVE_MIN_S` | 90 | Absolute floor (seconds) of that reserve on normal clocks. |
+| `PREDICT_RESERVE_MAX_FRAC` | 0.25 | Ceiling: the reserve never exceeds this share of remaining time. |
 | `NAS_POPULATION` | 100 | Aging-evolution population size. Larger → more diversity. |
 | `NAS_ROUNDS` | 2000 | Max evolution rounds (search stops at the time budget first). |
 | `NAS_TOURNAMENT` | 25 | Tournament size. Higher → greedier selection, less exploration. |
@@ -457,10 +465,15 @@ The AZ-NAS score combined in `proxies.py` is:
 score = expressivity + progressivity + trainability - LAMBDA_COMPLEXITY * log(params)
 ```
 
-The competition facts (`N_COMPETITION_DATASETS=3`, `TOTAL_COMPETITION_HOURS=24`,
-`COMPETITION_OVERHEAD_HOURS=0.5`) also live in `config.py`; they are given by the
-organisers, not tuning knobs. Per-dataset time is then split by the halving policy
-in `helpers.GlobalBudgetGovernor` (DS1 = pool/2, DS2 = leftover/2, last = all left).
+**Time model (2026 kit)**: the organisers' evaluator gives each dataset its own
+clock, sized from the dataset's `time_limit` metadata field (hours; official
+default 0.5 h when absent). Time does not carry across datasets. Within one
+dataset the pipeline splits the clock as: NAS gets `SEARCH_FRAC` of the time
+remaining when search starts; training gets everything left minus the predict
+reserve — `max(PREDICT_RESERVE_MIN_S, remaining × PREDICT_RESERVE_FRAC)`,
+capped at `remaining × PREDICT_RESERVE_MAX_FRAC` so short clocks still train.
+The reserve guarantees prediction and artifact saving always fit before the
+clock expires (a missed predict scores −10).
 
 > **Geometry, not config**: dataset-specific architecture choices (family,
 > anisotropy, pooling budget, horizontal-flip, attention enable) are **not** in
@@ -567,21 +580,27 @@ threshold, edit `infer_family()` in `family.py`.
 
 ### 8.5 Evaluation time limit
 
-The `time_limit` field in dataset metadata controls the total wall-clock seconds given to the full pipeline (DataProcessor + NAS + Trainer):
+Each dataset's `time_limit` metadata field (in **hours**) sets that dataset's
+clock — this is the official 2026 model, one independent clock per dataset,
+default 0.5 h when the field is absent:
 
-```bash
-# In evaluation/main.py, the --time_limit flag sets this:
-python evaluation/main.py --time_limit 1200   # 20 minutes
-
-# For quick debugging:
-python evaluation/main.py --time_limit 120    # 2 minutes (very short training)
-
-# For a competition-like run:
-python evaluation/main.py --time_limit 3600   # 1 hour
+```jsonc
+// datasets/<name>/metadata
+{"num_classes": 20, "input_shape": [50000, 3, 28, 28],
+ "codename": "Adaline", "benchmark": 89.85, "time_limit": 1.0}
 ```
 
-NAS consumes `SEARCH_FRAC` of the per-dataset allocation; the trainer gets the
-remainder of that dataset's budget (via `GlobalBudgetGovernor.effective_remaining()`).
+For local testing you can override it without touching the metadata:
+
+```bash
+python run.py --time 0.33              # 20 minutes per dataset
+python run.py --time 0.03 --truncate   # ~2-minute smoke test
+python run.py                          # exactly what the official evaluator does
+```
+
+Within a dataset: NAS consumes `SEARCH_FRAC` of the time remaining at search
+start; the trainer gets everything left minus the predict reserve
+(`PREDICT_RESERVE_FRAC` / `PREDICT_RESERVE_MIN_S`, §8.1).
 
 ---
 
@@ -611,13 +630,12 @@ python run.py --time 0.08      # ~5 min per dataset
 ### Scenario B: Large GPU, serious search (A100 / H100)
 
 ```python
-# In config.py — bigger, greedier search and more training:
+# In config.py — bigger, greedier search:
 NAS_POPULATION  = 200
 NAS_ROUNDS      = 5000
 NAS_TOURNAMENT  = 25
 NAS_PROXY_BATCH = 64
-SEARCH_FRAC     = 0.40
-TRAIN_FRAC      = 0.55
+SEARCH_FRAC     = 0.40   # training automatically gets the rest minus the predict reserve
 ```
 
 The memory budget needs no change — `repair.py` auto-targets ~80% of the actual
@@ -749,29 +767,29 @@ CORR_N_EPOCHS = 1    # Section 7: 1 epoch per arch instead of 3
 
 ### 11.2 Expected directory structure
 
+Six NumPy files plus a `metadata` file (no extension) per dataset — this is
+the layout the official evaluator and `run.py` both expect:
+
 ```
 datasets/
   AddNIST/
-    train/
-    valid/
-    test/
-    metadata.json
+    train_x.npy   train_y.npy
+    valid_x.npy   valid_y.npy
+    test_x.npy    test_y.npy      # test_y only exists locally, never on the server
+    metadata
   CIFARTile/
-    train/
-    valid/
-    test/
-    metadata.json
-  ...
+    ...
 ```
 
-### 11.3 metadata.json fields
+### 11.3 metadata fields
 
-```json
+```jsonc
 {
-  "input_shape": [1, 3, 32, 32],    // [batch, channels, height, width]
-  "num_classes": 10,                 // Number of output classes
-  "benchmark": 65.0,                 // Baseline accuracy (determines search budget)
-  "time_limit": 1200                 // Total seconds for the pipeline
+  "input_shape": [50000, 3, 28, 28],  // [n_datapoints, channels, height, width]
+  "num_classes": 20,                  // number of output classes
+  "codename": "Adaline",              // unique dataset identifier used for output files
+  "benchmark": 89.85,                 // organiser baseline accuracy (used only by score.py)
+  "time_limit": 1.0                   // clock for this dataset, in HOURS (default 0.5)
 }
 ```
 
