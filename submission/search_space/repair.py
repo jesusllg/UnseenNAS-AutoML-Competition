@@ -215,6 +215,16 @@ def repair(genotype: Genotype, C: int, H: int, W: int,
         if ds == 'stride2' and (h % 2 != 0 or w % 2 != 0):
             ds = stage.downsample = 'maxpool'
 
+        # (a3) pooling needs ≥2 px on every axis it halves — MaxPool2d(2) on a
+        # size-1 axis is a hard PyTorch error, not a no-op. Unseen data can be
+        # 1×1 spatial (pure channel vectors) or collapse to 1 mid-net; without
+        # this, repair's floor-at-1 tracking says "fine" while the built model
+        # crashes on its first forward.
+        if ds in ('maxpool', 'avgpool'):
+            poolable = w if aniso == 'W' else h if aniso == 'H' else min(h, w)
+            if poolable < 2:
+                ds = stage.downsample = 'identity'
+
         # (b) pool budget
         if ds != 'identity':
             pool_steps += 1
