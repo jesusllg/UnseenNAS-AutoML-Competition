@@ -88,7 +88,7 @@ _FALLBACK = {
 
 # Pipeline hyperparameters: single source of truth in config.py.
 from config import (NAS_POPULATION, NAS_ROUNDS, NAS_TOURNAMENT, SEARCH_FRAC,
-                    NAS_PROXY_BATCH, LEARNING_RATE, WEIGHT_DECAY,
+                    SEARCH_MAX_S, NAS_PROXY_BATCH, LEARNING_RATE, WEIGHT_DECAY,
                     SMOKE_TIME_S, LOW_VRAM_MB,
                     MIN_AFFORDABLE_EPOCHS, TRAINABILITY_TOP_K)
 
@@ -174,9 +174,15 @@ class NAS:
         remaining = get_safe_time_remaining(self.metadata, self.clock)
         n_pop, n_rounds, tourney_k, pbatch, search_frac = \
             _adaptive_search_params(remaining)
-        search_budget  = split_budget(remaining, search_frac)['search_s']
+        # Fraction of the clock, hard-capped in absolute terms: long clocks
+        # (~8 h/dataset) must not turn into multi-hour proxy searches. Unused
+        # search time flows back to training automatically — the trainer
+        # budgets from the live clock when IT starts.
+        search_budget  = min(split_budget(remaining, search_frac)['search_s'],
+                             SEARCH_MAX_S)
         t_search_start = time.perf_counter()
-        print(f"  NAS | sf={search_frac:.2f} → budget={show_time(search_budget)}"
+        print(f"  NAS | sf={search_frac:.2f} cap={show_time(SEARCH_MAX_S)}"
+              f" → budget={show_time(search_budget)}"
               f"  pop={n_pop} rounds={n_rounds} | device={self.device}")
 
         # ── Import search space ───────────────────────────────────────────────

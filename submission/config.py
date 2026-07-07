@@ -34,6 +34,14 @@ GLOBAL_SEED = 42
 
 SEARCH_FRAC = 0.30   # NAS search: fraction of the clock remaining at NAS start
 
+# Absolute ceiling on search time. SEARCH_FRAC alone scales with the clock —
+# on an 8 h dataset that is ~2.4 h of proxy search, which is past the point of
+# diminishing returns for NAS_ROUNDS evaluations and steals real training
+# epochs. Search stops at whichever bound hits first; anything unused flows
+# back to training automatically (the trainer budgets from the LIVE clock at
+# its own start, budgets are ceilings, never pre-allocated slices).
+SEARCH_MAX_S = 3600.0   # never spend more than 1 h searching, on any clock
+
 # Training runs until the clock minus a reserve kept back for prediction and
 # artifact saving. The reserve is a fraction of the time remaining when
 # training starts, with an absolute floor so normal clocks always leave room
