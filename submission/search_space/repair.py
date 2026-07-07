@@ -133,7 +133,8 @@ def _default_memory_budget_mb() -> float:
             return total_mb * 0.80
     except Exception:
         pass
-    return 16384.0  # 16 GB fallback when no GPU info is available
+    # No CUDA info: the evaluation hardware is unknown — assume modest.
+    return 8192.0
 
 
 # ── Repair rules ──────────────────────────────────────────────────────────────

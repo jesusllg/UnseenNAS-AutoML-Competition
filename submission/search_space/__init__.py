@@ -16,6 +16,7 @@ from .proxies import (
     expressivity, progressivity, trainability, complexity_penalty,
 )
 from .evolution import Individual, aging_evolution, best_individual
+from .seeds import seed_genotypes_for_family
 
 __all__ = [
     # genotype
@@ -39,4 +40,6 @@ __all__ = [
     'expressivity', 'progressivity', 'trainability', 'complexity_penalty',
     # evolution
     'Individual', 'aging_evolution', 'best_individual',
+    # seeds
+    'seed_genotypes_for_family',
 ]

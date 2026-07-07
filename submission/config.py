@@ -26,23 +26,39 @@ GLOBAL_SEED = 42
 
 
 # ── Time budget (per-dataset, 2026 competition model) ─────────────────────────
-# The organiser's evaluator gives EACH dataset its own clock, sized from the
-# dataset's `time_limit` metadata field (default 0.5 h when absent). Time does
-# NOT carry over between datasets, and exceeding a dataset's clock fails that
-# dataset. So all budgeting below is a fraction of the clock the organiser
-# hands us — there is no global pool.
+# Per the organisers' clarification: time applies PER DATASET (final run is
+# ~24 h across 3 datasets, roughly 8 h each); nothing carries over, and
+# exceeding a dataset's clock fails that dataset. The authoritative signal is
+# metadata['time_remaining'] / the live clock — helpers.get_safe_time_remaining
+# reconciles them conservatively (min of the available sources).
 
 SEARCH_FRAC = 0.30   # NAS search: fraction of the clock remaining at NAS start
 
 # Training runs until the clock minus a reserve kept back for prediction and
 # artifact saving. The reserve is a fraction of the time remaining when
 # training starts, with an absolute floor so normal clocks always leave room
-# to predict — but capped at a fraction of the remaining time so that on very
-# short clocks the floor can never swallow the whole training budget.
+# to predict — capped both as a share (short clocks must still train) and in
+# absolute seconds (an 8 h clock does not need a 30-minute reserve).
 # Failing to predict scores -10; a slightly shorter training run costs far less.
-PREDICT_RESERVE_FRAC     = 0.07   # of clock remaining at training start
-PREDICT_RESERVE_MIN_S    = 90.0   # absolute floor (seconds)
-PREDICT_RESERVE_MAX_FRAC = 0.25   # ceiling: reserve never exceeds this share
+PREDICT_RESERVE_FRAC     = 0.07    # of clock remaining at training start
+PREDICT_RESERVE_MIN_S    = 90.0    # absolute floor (seconds)
+PREDICT_RESERVE_MAX_FRAC = 0.25    # ceiling: reserve never exceeds this share
+PREDICT_RESERVE_MAX_S    = 600.0   # absolute ceiling (seconds)
+
+# Adaptive modes (nas.py scales its effort with these):
+#   smoke  — remaining time below SMOKE_TIME_S → minimal search, short training
+#   low-resource — small/absent GPU → smaller population and proxy batch
+SMOKE_TIME_S     = 1200.0  # < 20 min left → phase-2-style minimal mode
+LOW_VRAM_MB      = 6000.0  # below this (or CPU-only) → low-resource scaling
+
+# Budget-aware final selection. The AZ-NAS proxy knows nothing about the
+# clock: V1→V2 evidence showed 10× params bought ~+1 AZ point but made epochs
+# ~10× slower — models stopped converging inside the budget (GeoClassing
+# regressed and never finished). After evolution we walk the population
+# best-first and pick the first candidate whose measured step time affords at
+# least MIN_AFFORDABLE_EPOCHS of training in the remaining budget.
+MIN_AFFORDABLE_EPOCHS = 25   # a model that can't run this many epochs won't converge
+TRAINABILITY_TOP_K    = 8    # how many top-fitness candidates to time-test
 
 
 # ── NAS search (aging evolution) ──────────────────────────────────────────────

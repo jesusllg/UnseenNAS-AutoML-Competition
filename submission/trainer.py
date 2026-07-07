@@ -11,11 +11,12 @@ import torch.nn as nn
 from torch import optim
 from sklearn.metrics import accuracy_score
 
-from helpers import show_time, set_seeds, GLOBAL_SEED, free_gpu
+from helpers import (show_time, set_seeds, GLOBAL_SEED, free_gpu,
+                     get_safe_time_remaining, split_budget,
+                     make_amp_tools, is_oom)
 
 # Pipeline hyperparameters: single source of truth in config.py.
 from config import (
-    PREDICT_RESERVE_FRAC, PREDICT_RESERVE_MIN_S, PREDICT_RESERVE_MAX_FRAC,
     WEIGHT_DECAY,
     LEARNING_RATE, GRAD_CLIP_NORM, LR_T_MAX, LR_ETA_MIN,
     LABEL_SMOOTHING, LABEL_SMOOTHING_MIN_CLASSES,
@@ -112,17 +113,14 @@ class Trainer:
 
         weight_decay = WEIGHT_DECAY
 
-        # Training budget: everything left on the organiser's per-dataset clock
-        # minus a reserve held back for prediction + artifact saving. A missed
-        # predict scores -10; a slightly shorter training run costs far less.
-        # The floor covers save+predict on normal clocks; the MAX_FRAC ceiling
-        # keeps the floor from swallowing the whole budget on very short clocks.
-        remaining = self.clock.check()
-        self._reserve_s = min(
-            max(PREDICT_RESERVE_MIN_S, remaining * PREDICT_RESERVE_FRAC),
-            remaining * PREDICT_RESERVE_MAX_FRAC,
-        )
-        train_budget = max(0.0, remaining - self._reserve_s)
+        # Training budget: everything left on this dataset's clock (metadata
+        # time_remaining and live clock reconciled conservatively) minus a
+        # reserve held back for prediction + output writing. A missed predict
+        # scores -10; a slightly shorter training run costs far less.
+        remaining = get_safe_time_remaining(self.metadata, self.clock)
+        budget = split_budget(remaining)
+        self._reserve_s = budget['reserve_s']
+        train_budget    = budget['train_s']
         deadline = time.perf_counter() + train_budget
         t_train_start  = time.perf_counter()
 
@@ -145,7 +143,8 @@ class Trainer:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=LR_ETA_MIN)
 
         use_amp = torch.cuda.is_available()
-        scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
+        # AMP tools resolved per torch version (2.x torch.amp / 1.10 cuda.amp)
+        self._autocast, scaler = make_amp_tools(use_amp)
 
         best_acc   = 0.0
         best_epoch = 0
@@ -251,12 +250,23 @@ class Trainer:
         print(f"  {'─'*55}")
 
         train_elapsed = time.perf_counter() - t_train_start
-        self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
-        # Model save is diagnostics only — never let it eat into predict time.
-        if self.clock.check() > self._reserve_s * 0.5:
-            self._save_model()
-        else:
-            print("  (skipped model save — protecting predict reserve)")
+        # Artifacts are diagnostics only — an I/O failure must never fail the
+        # dataset, and saving must never eat into predict time.
+        try:
+            self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
+        except Exception as e:
+            print(f"  [Trainer] report save failed (non-fatal): {e}")
+        try:
+            if self.clock.check() > self._reserve_s * 0.5:
+                self._save_model()
+            else:
+                print("  (skipped model save — protecting predict reserve)")
+        except Exception as e:
+            print(f"  [Trainer] model save failed (non-fatal): {e}")
+
+        # Model is safely on CPU after _save_model (or still referenced here
+        # regardless) — reclaim search/training GPU memory before prediction.
+        free_gpu()
 
         return self.model
 
@@ -287,7 +297,7 @@ class Trainer:
                 outs = []
                 for i in range(0, bs, chunk):
                     xs, ys = x[i:i + chunk], y[i:i + chunk]
-                    with torch.amp.autocast('cuda', enabled=use_amp):
+                    with self._autocast():
                         out  = self.model(xs)
                         loss = criterion(out, ys) * (xs.size(0) / bs)
                     scaler.scale(loss).backward()
@@ -297,7 +307,11 @@ class Trainer:
                 scaler.step(optimizer)
                 scaler.update()
                 return torch.cat(outs, dim=0)
-            except torch.cuda.OutOfMemoryError:
+            except RuntimeError as e:
+                # is_oom covers torch.cuda.OutOfMemoryError (1.13+ subclass of
+                # RuntimeError) AND the plain-RuntimeError OOM of older torch.
+                if not is_oom(e):
+                    raise
                 optimizer.zero_grad(set_to_none=True)
                 free_gpu()
                 new_chunk = max(1, chunk // 2)
@@ -378,7 +392,17 @@ class Trainer:
         print(f"  Model saved  → {path}  ({size_mb:.1f} MB)")
 
     # ------------------------------------------------------------------
-    def predict(self, test_loader):
+    def _majority_class(self) -> int:
+        """Most frequent training label — last-resort prediction filler."""
+        try:
+            y = getattr(self.train_dl.dataset, 'y', None)
+            if y is not None and len(y) > 0:
+                return int(torch.bincount(y).argmax().item())
+        except Exception:
+            pass
+        return 0
+
+    def _predict_model(self, test_loader):
         self.model.to(self.device).eval()
         preds = []
         # Honour the micro-batch limit discovered during training so inference
@@ -391,4 +415,37 @@ class Trainer:
                 chunk = eval_chunk or bs
                 for i in range(0, bs, chunk):
                     preds += self.model(x[i:i + chunk]).argmax(1).cpu().tolist()
+        return preds
+
+    def predict(self, test_loader):
+        """
+        Predictions MUST come back with exactly one label per test sample —
+        anything else breaks scoring. If model inference dies (OOM, corrupt
+        weights, anything), degrade to CPU inference, then, as an absolute
+        last resort, pad with the majority training class rather than fail
+        the dataset outright.
+        """
+        try:
+            preds = self._predict_model(test_loader)
+        except Exception:
+            print("  [Trainer] predict failed — retrying on CPU.")
+            print(traceback.format_exc())
+            free_gpu()
+            try:
+                self.device = torch.device('cpu')
+                preds = self._predict_model(test_loader)
+            except Exception:
+                print("  [Trainer] CPU predict also failed — majority-class fallback.")
+                preds = []
+
+        try:
+            n_test = len(test_loader.dataset)
+        except Exception:
+            return preds   # cannot validate length — return what we have
+
+        if len(preds) != n_test:
+            maj = self._majority_class()
+            print(f"  [Trainer] prediction count {len(preds)} != {n_test} test"
+                  f" samples — padding/truncating with class {maj}.")
+            preds = list(preds)[:n_test] + [maj] * max(0, n_test - len(preds))
         return preds

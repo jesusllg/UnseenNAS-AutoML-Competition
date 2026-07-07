@@ -17,7 +17,10 @@ class FamilyProfile:
     force_groupnorm: bool        = False # must use GroupNorm instead of BN
     min_channels: int            = 16
     max_params_m: float          = 50.0  # soft cap in millions
-    augment_hflip: bool          = True  # whether DataProcessor applies RandomHorizontalFlip
+    # Augmentation policy: conservative by default for unseen data. Flips and
+    # crops silently destroy semantics on symbolic grids, sequences, volumes
+    # and channel-stacked data — only the natural-image families opt in.
+    augment_hflip: bool          = False
     # Hints (for initial sampling bias only — NOT hard constraints)
     preferred_blocks: List[str]  = field(default_factory=list)
     forbidden_blocks: List[str]  = field(default_factory=list)
@@ -78,7 +81,10 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
             max_pool_steps  = 2,
             enable_attention= True,   # per-stage spatial guard in repair governs
             force_groupnorm = True,
-            preferred_blocks= ['ResidualBlock', 'BottleneckBlock', 'ConvBlock'],
+            # Volume-as-channels: the "depth" axis lives in C, so channel
+            # mixing is the natural primitive alongside spatial residuals.
+            preferred_blocks= ['ChannelMixingBlock', 'ResidualBlock',
+                               'BottleneckBlock', 'ConvBlock'],
             forbidden_blocks= ['AnisotropicBlock'],
         )
 
@@ -120,6 +126,7 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
             max_pool_steps  = pool_steps,
             enable_attention= True,  # per-stage repair enforces the 256-token limit
             force_groupnorm = False,
+            augment_hflip   = True,  # natural images: flip is safe
             preferred_blocks= ['MBConvBlock', 'ResidualBlock', 'SepConvBlock',
                                'BottleneckBlock', 'DilatedConvBlock'],
             forbidden_blocks= [],
@@ -133,6 +140,7 @@ def infer_family(C: int, H: int, W: int, num_classes: int) -> FamilyProfile:
             max_pool_steps  = 3,
             enable_attention= True,
             force_groupnorm = False,
+            augment_hflip   = True,  # natural images: flip is safe
             preferred_blocks= ['ResidualBlock', 'MBConvBlock', 'ConvBlock', 'SepConvBlock'],
             forbidden_blocks= [],
         )

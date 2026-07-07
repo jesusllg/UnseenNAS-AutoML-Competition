@@ -58,10 +58,16 @@ def aging_evolution(
     time_budget_s:   Optional[float] = None,
     seed:            int  = _DEFAULT_SEED,
     verbose:         bool = False,
+    seed_genotypes:  Optional[List[Genotype]] = None,
 ) -> List[Individual]:
     """
     Runs Aging Evolution and returns the full population sorted by fitness.
     Stops early if time_budget_s is reached.
+
+    seed_genotypes: curated starting architectures (see seeds.py), consumed
+    first during initialisation through the SAME repair/dry-run/proxy path as
+    random samples — a seed invalid for this geometry is skipped, never fatal.
+    The rest of the population is filled randomly, preserving exploration.
     """
     # Seed all randomness so the search is fully reproducible
     random.seed(seed)
@@ -73,8 +79,9 @@ def aging_evolution(
 
     population: List[Individual] = []
     start_time = time.time()
+    seed_queue = [g.clone() for g in (seed_genotypes or [])]
 
-    # ── Initialise population ─────────────────────────────────────────────────
+    # ── Initialise population (curated seeds first, then random) ─────────────
     n_init_attempts = 0
     while len(population) < n_population:
         if time_budget_s and (time.time() - start_time) > time_budget_s * 0.5:
@@ -86,10 +93,13 @@ def aging_evolution(
                   f" Continuing with partial population.")
             break
 
-        g = sample_random_genotype(
-            preferred_blocks=family.preferred_blocks,
-            forbidden_blocks=family.forbidden_blocks,
-        )
+        if seed_queue:
+            g = seed_queue.pop(0)
+        else:
+            g = sample_random_genotype(
+                preferred_blocks=family.preferred_blocks,
+                forbidden_blocks=family.forbidden_blocks,
+            )
         try:
             g = repair(g, C, H, W, num_classes, family)
             model = build_model(g, C, H, W, num_classes, aniso_axis=family.aniso_axis)

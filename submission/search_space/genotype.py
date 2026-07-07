@@ -48,6 +48,10 @@ def stem_stride(stem_type: str) -> int:
     return 2 if stem_type.endswith('_s2') else 1
 
 # ── Cardinality map (for sampling / mutation) ──────────────────────────────────
+# NOTE: skip_mode is intentionally ABSENT. Every block in block_library.py
+# hardwires its own residual skip; the gene never reached the phenotype, so
+# mutating it burned evolution rounds on architecturally-identical children.
+# The dataclass field remains (JSON back-compat) but search never touches it.
 STAGE_FIELD_CARDINALITY: Dict[str, int] = {
     'block_type':    len(BLOCK_TYPES),
     'kernel_idx':    len(KERNEL_LIST),
@@ -57,7 +61,6 @@ STAGE_FIELD_CARDINALITY: Dict[str, int] = {
     'dilation_idx':  len(DILATION_LIST),
     'se_enabled':    2,
     'se_ratio_idx':  len(SE_RATIO_LIST),
-    'skip_mode':     len(SKIP_MODES),
     'downsample':    len(DOWNSAMPLE_OPS),
     'drop_path_idx': len(DROP_PATH_LIST),
     'group_w_idx':   len(GROUP_W_LIST),
@@ -171,7 +174,6 @@ def _rand_stage(forbidden_blocks=None) -> StageGene:
         dilation_idx  = random.randrange(len(DILATION_LIST)),
         se_enabled    = random.randint(0, 1),
         se_ratio_idx  = random.randrange(len(SE_RATIO_LIST)),
-        skip_mode     = random.choice(SKIP_MODES),
         downsample    = random.choice(DOWNSAMPLE_OPS),
         drop_path_idx = random.randrange(len(DROP_PATH_LIST)),
         group_w_idx   = random.randrange(len(GROUP_W_LIST)),
@@ -226,8 +228,6 @@ def _mutate_stage_field(stage: StageGene, field_name: str) -> None:
         stage.se_enabled = 1 - stage.se_enabled
     elif field_name == 'se_ratio_idx':
         stage.se_ratio_idx = random.randrange(len(SE_RATIO_LIST))
-    elif field_name == 'skip_mode':
-        stage.skip_mode = random.choice(SKIP_MODES)
     elif field_name == 'downsample':
         stage.downsample = random.choice(DOWNSAMPLE_OPS)
     elif field_name == 'drop_path_idx':
