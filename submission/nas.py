@@ -90,7 +90,11 @@ _FALLBACK = {
 from config import (NAS_POPULATION, NAS_ROUNDS, NAS_TOURNAMENT, SEARCH_FRAC,
                     SEARCH_MAX_S, NAS_PROXY_BATCH, LEARNING_RATE, WEIGHT_DECAY,
                     SMOKE_TIME_S, LOW_VRAM_MB,
-                    MIN_AFFORDABLE_EPOCHS, TRAINABILITY_TOP_K)
+                    MIN_AFFORDABLE_EPOCHS, TRAINABILITY_TOP_K,
+                    LABEL_SMOOTHING, LABEL_SMOOTHING_MIN_CLASSES,
+                    RERANK_TOP_K, RERANK_BATCHES, RERANK_MAX_S,
+                    RERANK_MAX_TOTAL_S, RERANK_VAL_MAX,
+                    RERANK_BETA, RERANK_GAMMA)
 
 
 def _adaptive_search_params(remaining_s: float):
@@ -189,8 +193,8 @@ class NAS:
         try:
             from search_space import (
                 infer_family, sample_random_genotype, repair,
-                build_model, az_nas_score, aging_evolution, best_individual,
-                seed_genotypes_for_family,
+                build_model, az_nas_components, aging_evolution,
+                best_individual, seed_genotypes_for_family,
             )
         except ImportError as e:
             print(f"  [NAS] search_space import failed ({e}), using legacy fallback.")
@@ -208,7 +212,9 @@ class NAS:
               f"  max_pools={family.max_pool_steps}  groupnorm={family.force_groupnorm}")
 
         def proxy_fn(model, batch_x, device):
-            return az_nas_score(model, batch_x, device, reinit=True)
+            # Raw components — evolution combines them by WITHIN-POPULATION
+            # rank (never raw sums, never dropping failed components).
+            return az_nas_components(model, batch_x, device, reinit=True)
 
         # Curated seeds anchor the population with known-trainable baselines;
         # invalid ones for this geometry are skipped inside evolution.
@@ -245,20 +251,31 @@ class NAS:
             print("  [NAS] Empty population — using legacy fallback.")
             return self._legacy_search(in_c, n_cls, (H, W))
 
-        # ── Budget-aware final selection (anti proxy-gaming) ─────────────────
-        # The proxy knows nothing about the clock: picking the raw best let
-        # 10×-param models through that never converged inside the budget.
-        best = self._pick_trainable(population, family, in_c, H, W, n_cls,
-                                    build_model)
+        # ── Supervised final selection (anti proxy-gaming) ───────────────────
+        # The proxy only filters. Val–test corr ≈0.997 on the practice suite,
+        # so a short REAL training probe on validation is the reliable picker.
+        # Falls back to the speed-only trainability gate in smoke mode.
+        best = self._rerank_topk(population, family, in_c, H, W, n_cls,
+                                 build_model)
 
         n_evaluated = len(population)
         search_elapsed = time.perf_counter() - t_search_start
         print(f"  Search done: {n_evaluated} evaluated, best AZ-NAS={best.fitness:.4f}")
+
+        def _jsonable(v):
+            return round(float(v), 4) if np.isfinite(v) else str(v)
+
         self.metadata['nas_report'] = {
             'n_tried':        n_evaluated,
             'best_proxy_val': round(float(best.fitness), 4),
             'best_stages':    str(best.genotype),
             'search_s':       round(search_elapsed, 1),
+            # Raw AZ-NAS components of the winner + the supervised-rerank
+            # table — the observability that made the V3 diagnosis possible
+            # only through guesswork.
+            'components':     {k: _jsonable(v)
+                               for k, v in (best.components or {}).items()},
+            'rerank':         getattr(self, '_rerank_table', []),
         }
 
         try:
@@ -279,7 +296,12 @@ class NAS:
             codename = self.metadata.get('codename', 'unknown')
             try:
                 geno_path = pred_dir / f'{codename}_genotype.json'
-                geno_path.write_text(json.dumps(best.genotype.to_dict(), indent=2))
+                geno_dict = best.genotype.to_dict()
+                # Extra diagnostic keys (ignored by Genotype.from_dict, so the
+                # file still round-trips as a genotype).
+                geno_dict['_proxy'] = self.metadata['nas_report'].get('components', {})
+                geno_dict['_rank_fitness'] = round(float(best.fitness), 4)
+                geno_path.write_text(json.dumps(geno_dict, indent=2))
                 print(f"  Genotype JSON  → {geno_path}")
             except Exception as eg:
                 print(f"  [NAS] Genotype save failed: {eg}")
@@ -302,7 +324,137 @@ class NAS:
             traceback.print_exc()
             return self._legacy_search(in_c, n_cls, (H, W))
 
-    # ── Budget-aware selection ────────────────────────────────────────────────
+    # ── Supervised top-K reranking ────────────────────────────────────────────
+
+    def _rerank_topk(self, population, family, in_c, H, W, n_cls, build_model):
+        """
+        Short-train the top proxy candidates IDENTICALLY and pick by early
+        validation accuracy:  U = val_acc − β·log10(params) − γ·log10(epoch_s).
+
+        Rationale: the proxy cannot see the task (no labels) and V3 showed it
+        picking models that memorise or cannot converge in budget. Validation
+        predicts test almost perfectly (corr ≈0.997), so ~150 real batches per
+        candidate buys the signal zero-cost proxies fundamentally lack.
+        Candidates are deduped and capped at 2 per param scale so the probe
+        set is diverse, not 10 clones of one optimum.
+        """
+        import json as _json
+        from search_space import estimate_params
+
+        remaining = get_safe_time_remaining(self.metadata, self.clock)
+        if remaining < SMOKE_TIME_S:
+            print("  NAS | rerank skipped (smoke mode) — trainability gate only")
+            return self._pick_trainable(population, family, in_c, H, W, n_cls,
+                                        build_model)
+
+        train_s_budget = split_budget(remaining)['train_s']
+        steps = max(1, len(self.train_loader))
+
+        # Candidate pool: best-first, deduped, max 2 per log2-param bucket
+        seen, buckets, cands = set(), {}, []
+        for ind in population:
+            sig = _json.dumps(ind.genotype.to_dict(), sort_keys=True)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            b = int(round(np.log2(max(
+                estimate_params(ind.genotype, in_c, H, W, n_cls), 2))))
+            if buckets.get(b, 0) >= 2:
+                continue
+            buckets[b] = buckets.get(b, 0) + 1
+            cands.append(ind)
+            if len(cands) >= RERANK_TOP_K:
+                break
+
+        ls = LABEL_SMOOTHING if n_cls >= LABEL_SMOOTHING_MIN_CLASSES else 0.0
+        results, t_phase = [], time.perf_counter()
+        for ind in cands:
+            if time.perf_counter() - t_phase > RERANK_MAX_TOTAL_S:
+                print("  NAS | rerank phase budget reached — stopping probes")
+                break
+            if get_safe_time_remaining(self.metadata, self.clock) < remaining * 0.5:
+                print("  NAS | rerank stopped early — protecting training time")
+                break
+            try:
+                set_seeds(GLOBAL_SEED)   # identical conditions per candidate
+                model = build_model(ind.genotype, in_c, H, W, n_cls,
+                                    aniso_axis=family.aniso_axis).to(self.device)
+                n_params = sum(p.numel() for p in model.parameters())
+                opt  = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE,
+                                         weight_decay=WEIGHT_DECAY)
+                crit = nn.CrossEntropyLoss(label_smoothing=ls)
+
+                model.train()
+                nb, t0, done = 0, time.perf_counter(), False
+                while not done:
+                    saw_batch = False
+                    for x, y in self.train_loader:
+                        saw_batch = True
+                        if nb >= RERANK_BATCHES or \
+                           time.perf_counter() - t0 > RERANK_MAX_S:
+                            done = True
+                            break
+                        x, y = x.to(self.device), y.to(self.device)
+                        opt.zero_grad(set_to_none=True)
+                        crit(model(x), y).backward()
+                        opt.step()
+                        nb += 1
+                    if not saw_batch:
+                        break
+                if nb == 0:
+                    raise RuntimeError("no training batches ran")
+                epoch_s    = (time.perf_counter() - t0) / nb * steps
+                affordable = train_s_budget / max(epoch_s, 1e-6)
+
+                model.eval()
+                correct = total = 0
+                with torch.no_grad():
+                    for x, y in self.valid_loader:
+                        pred = model(x.to(self.device)).argmax(1).cpu()
+                        correct += (pred == y).sum().item()
+                        total   += y.size(0)
+                        if total >= RERANK_VAL_MAX:
+                            break
+                val_acc = correct / max(total, 1)
+                del model, opt
+                free_gpu()
+
+                if affordable < MIN_AFFORDABLE_EPOCHS:
+                    print(f"  rerank | val={val_acc*100:5.1f}%  {n_params/1e6:6.2f}M"
+                          f"  ~{epoch_s:5.0f}s/ep  EXCLUDED"
+                          f" (~{affordable:.0f} epochs affordable)")
+                    continue
+                u = (val_acc
+                     - RERANK_BETA  * np.log10(max(n_params, 10))
+                     - RERANK_GAMMA * np.log10(max(epoch_s, 1e-3)))
+                results.append({'ind': ind, 'val': val_acc, 'params': n_params,
+                                'epoch_s': epoch_s, 'batches': nb, 'u': u})
+                print(f"  rerank | val={val_acc*100:5.1f}%  {n_params/1e6:6.2f}M"
+                      f"  ~{epoch_s:5.0f}s/ep  U={u:.4f}")
+            except Exception as e:
+                free_gpu()
+                print(f"  rerank | candidate failed ({e}) — skipped")
+                continue
+
+        # Observability: table for nas_report (without the Individual object)
+        self._rerank_table = [
+            {'val': round(r['val'], 4), 'params': int(r['params']),
+             'epoch_s': round(r['epoch_s'], 1), 'batches': r['batches'],
+             'u': round(r['u'], 4)}
+            for r in results
+        ]
+
+        if not results:
+            print("  NAS | rerank produced no viable candidate — gate fallback")
+            return self._pick_trainable(population, family, in_c, H, W, n_cls,
+                                        build_model)
+        chosen = max(results, key=lambda r: r['u'])
+        print(f"  NAS | rerank picked val={chosen['val']*100:.1f}%"
+              f"  {chosen['params']/1e6:.2f}M  ~{chosen['epoch_s']:.0f}s/ep"
+              f"  ({len(results)} probed)")
+        return chosen['ind']
+
+    # ── Budget-aware selection (smoke-mode / fallback path) ──────────────────
 
     def _pick_trainable(self, population, family, in_c, H, W, n_cls, build_model):
         """

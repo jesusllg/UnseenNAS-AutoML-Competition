@@ -12,7 +12,7 @@ from .block_library import BLOCK_REGISTRY
 from .builder import build_model, compute_output_spatial, SearchSpaceModel
 from .repair import repair, estimate_params, estimate_activations_mb
 from .proxies import (
-    az_nas_score, az_nas_score_full,
+    az_nas_score, az_nas_score_full, az_nas_components,
     expressivity, progressivity, trainability, complexity_penalty,
 )
 from .evolution import Individual, aging_evolution, best_individual
@@ -36,7 +36,7 @@ __all__ = [
     # repair
     'repair', 'estimate_params', 'estimate_activations_mb',
     # proxies
-    'az_nas_score', 'az_nas_score_full',
+    'az_nas_score', 'az_nas_score_full', 'az_nas_components',
     'expressivity', 'progressivity', 'trainability', 'complexity_penalty',
     # evolution
     'Individual', 'aging_evolution', 'best_individual',

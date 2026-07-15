@@ -25,17 +25,60 @@ from .builder import build_model
 
 try:
     from config import GLOBAL_SEED as _DEFAULT_SEED
+    from config import LAMBDA_COMPLEXITY_RANK as _LAMBDA_RANK
 except ImportError:
     _DEFAULT_SEED = 42   # standalone import without submission/ on sys.path
+    _LAMBDA_RANK  = 0.3
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class Individual:
-    genotype: Genotype
-    fitness:  float
-    age:      int = 0
+    genotype:   Genotype
+    fitness:    float
+    age:        int = 0
+    # Raw AZ-NAS components {e, p, t, c} when the proxy returns them; fitness
+    # is then a population-relative rank combination (see _rank_fitness).
+    components: Optional[dict] = None
+
+
+def _rank_fitness(group: List['Individual'],
+                  lambda_rank: float = _LAMBDA_RANK) -> None:
+    """
+    Set each Individual.fitness from within-group percentile ranks of its raw
+    components:  fitness = rank_E + rank_P + rank_T − lambda_rank·rank_C.
+
+    Raw component scales are incomparable (E grows with depth; T ≤ 0), so raw
+    sums let one component dominate — this is the rank normalisation the AZ-NAS
+    paper uses across a candidate pool. A non-finite component gets the WORST
+    rank (0.0) instead of being dropped: failing a measurement can never help.
+    """
+    n = len(group)
+    if n == 0:
+        return
+    denom = max(n - 1, 1)
+    ranks = [dict() for _ in range(n)]
+    for key in ('e', 'p', 't', 'c'):
+        vals = [ind.components.get(key, -np.inf) for ind in group]
+        keyf = lambda i: vals[i] if np.isfinite(vals[i]) else -np.inf
+        order = sorted(range(n), key=keyf)
+        # Tie-aware: equal raw values share the AVERAGE of their positions —
+        # otherwise ties hand out arbitrary rank differences that can outweigh
+        # a real penalty (e.g. a failed-T candidate luckily out-ranking a
+        # measured twin purely on tie order).
+        pos = 0
+        while pos < n:
+            end = pos
+            while end + 1 < n and keyf(order[end + 1]) == keyf(order[pos]):
+                end += 1
+            avg = (pos + end) / 2 / denom
+            for j in range(pos, end + 1):
+                i = order[j]
+                ranks[i][key] = avg if np.isfinite(vals[i]) else 0.0
+            pos = end + 1
+    for ind, rk in zip(group, ranks):
+        ind.fitness = rk['e'] + rk['p'] + rk['t'] - lambda_rank * rk['c']
 
 
 def _default_proxy(model, batch_x, device) -> float:
@@ -111,13 +154,30 @@ def aging_evolution(
             logger.debug("Init arch failed: %s", e)
             continue
 
-        population.append(Individual(g, fit))
-        if verbose:
-            print(f"  [init {len(population)}/{n_population}] fitness={fit:.4f}")
+        if isinstance(fit, dict):
+            # Rank mode: raw components stored; scalar fitness assigned later
+            # relative to the population (see _rank_fitness).
+            population.append(Individual(g, 0.0, components=fit))
+            if verbose:
+                print(f"  [init {len(population)}/{n_population}]"
+                      f" E={fit['e']:.2f} P={fit['p']:.2f} T={fit['t']:.2f}")
+        else:
+            population.append(Individual(g, fit))
+            if verbose:
+                print(f"  [init {len(population)}/{n_population}] fitness={fit:.4f}")
 
     if not population:
         logger.error("Could not initialise any valid architecture.")
         return population
+
+    # Rank mode is on when the proxy returns component dicts. The archive
+    # keeps EVERY evaluated individual so the final ranking is a single
+    # consistent ordering over the whole search history (argmax over history,
+    # as in Real et al.) — it supersedes the legacy global-best tracking.
+    rank_mode = population[0].components is not None
+    archive: List[Individual] = list(population) if rank_mode else []
+    if rank_mode:
+        _rank_fitness(population)
 
     # Pre-age initial population so FIFO eviction is correct from round 1.
     # init[0] (first inserted) gets the highest starting age → evicted first.
@@ -128,12 +188,13 @@ def aging_evolution(
     for i, ind in enumerate(population):
         ind.age = n_init - 1 - i  # init[0] → age n-1 (oldest), init[n-1] → age 0
 
-    best_fitness = max(ind.fitness for ind in population)
-    # Track global best separately — aging eviction removes the OLDEST, not the worst,
-    # so the best individual can get expelled from the population and be lost.
-    # This is a running max equivalent to argmax(all history), matching Real et al.
-    _gb = max(population, key=lambda x: x.fitness)
-    global_best: Individual = Individual(_gb.genotype, _gb.fitness)
+    if not rank_mode:
+        best_fitness = max(ind.fitness for ind in population)
+        # Track global best separately — aging eviction removes the OLDEST, not
+        # the worst, so the best individual can get expelled and be lost. This
+        # is a running max equivalent to argmax(all history) (Real et al.).
+        _gb = max(population, key=lambda x: x.fitness)
+        global_best: Individual = Individual(_gb.genotype, _gb.fitness)
 
     # ── Evolution rounds ──────────────────────────────────────────────────────
     for rnd in range(n_rounds):
@@ -171,8 +232,15 @@ def aging_evolution(
                 logger.debug("Mutation attempt %d failed: %s", tries, e)
                 fit = -np.inf
 
-        child = Individual(child_g, fit)
-        population.append(child)
+        if rank_mode:
+            if not isinstance(fit, dict):
+                continue   # all mutation attempts failed — skip the round
+            child = Individual(child_g, 0.0, components=fit)
+            population.append(child)
+            archive.append(child)
+        else:
+            child = Individual(child_g, fit)
+            population.append(child)
 
         # age all and remove oldest
         for ind in population:
@@ -180,13 +248,27 @@ def aging_evolution(
         population.sort(key=lambda x: x.age)
         population.pop(-1)  # remove oldest
 
-        if fit > best_fitness:
+        if rank_mode:
+            # Refresh population-relative fitness for the next tournament.
+            _rank_fitness(population)
+            if verbose and max(population, key=lambda x: x.fitness) is child:
+                print(f"  [round {rnd+1}/{n_rounds}] child leads population"
+                      f"  scale={scale}")
+        elif fit > best_fitness:
             best_fitness = fit
             # Snapshot BEFORE this individual ages out of the population.
             # child_g comes from mutate() so it's a fresh object not shared with population.
             global_best = Individual(child_g, fit)
             if verbose:
                 print(f"  [round {rnd+1}/{n_rounds}] new best fitness={fit:.4f}  scale={scale}")
+
+    if rank_mode:
+        # One consistent ranking over EVERYTHING evaluated during the search
+        # (population + everything aged out). Nothing good can be lost to
+        # aging eviction, so no separate global-best bookkeeping is needed.
+        _rank_fitness(archive)
+        archive.sort(key=lambda x: x.fitness, reverse=True)
+        return archive[:n_population]
 
     population.sort(key=lambda x: x.fitness, reverse=True)
 

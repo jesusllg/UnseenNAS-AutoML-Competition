@@ -69,16 +69,34 @@ MIN_AFFORDABLE_EPOCHS = 25   # a model that can't run this many epochs won't con
 TRAINABILITY_TOP_K    = 8    # how many top-fitness candidates to time-test
 
 
+# ── Supervised top-K reranking ────────────────────────────────────────────────
+# The proxy only FILTERS; the final pick is supervised. Val–test correlation
+# across the 13 practice datasets is ≈0.997, so a short real-training probe on
+# validation is a highly reliable selector of what will work on test — far
+# more reliable than any zero-cost signal. Each top candidate gets an
+# IDENTICAL micro-training (same optimizer/settings as the real Trainer),
+# then:  U = val_acc − β·log10(params) − γ·log10(epoch_s)
+# (val acc dominates; params/speed only break ties). Skipped in smoke mode
+# (falls back to the trainability gate).
+RERANK_TOP_K       = 10      # candidates short-trained (deduped, param-diverse)
+RERANK_BATCHES     = 150     # identical micro-training length per candidate
+RERANK_MAX_S       = 180.0   # per-candidate wall cap (seconds)
+RERANK_MAX_TOTAL_S = 1800.0  # whole-phase wall cap (seconds)
+RERANK_VAL_MAX     = 2000    # max validation samples scored per candidate
+RERANK_BETA        = 0.01    # weight of log10(params) tie-breaker
+RERANK_GAMMA       = 0.01    # weight of log10(epoch_s) tie-breaker
+
+
 # ── NAS search (aging evolution) ──────────────────────────────────────────────
 
 NAS_POPULATION = 100
 NAS_ROUNDS     = 2000   # effectively "run until the time budget expires"
 
-# Selection intensity = tournament / population. Real et al. used 25/100 with a
-# TRUE-accuracy fitness; our zero-cost proxy is far noisier, so high pressure
-# over a long search can exploit proxy noise and over-converge to
-# proxy-gaming, over-shrunk architectures. Lower it if that reappears.
-NAS_TOURNAMENT = 25
+# Selection intensity = tournament / population. Real et al. used 25/100 with
+# a TRUE-accuracy fitness; our zero-cost proxy is far noisier, and V3 showed
+# the predicted failure mode (proxy-gaming: oversized models that outscore but
+# under-generalise). Lowered 25 → 10 per that evidence.
+NAS_TOURNAMENT = 10
 
 # Number of samples in the single batch fed to the zero-cost proxy. Small by
 # design: the proxies score a forward/backward on one batch, so this trades
@@ -86,7 +104,18 @@ NAS_TOURNAMENT = 25
 NAS_PROXY_BATCH = 16
 
 
-# ── Zero-cost proxy (AZ-NAS) ──────────────────────────────────────────────────
+# ── Zero-cost proxy (AZ-NAS) — population-rank fitness ────────────────────────
+# Evolution compares candidates by WITHIN-POPULATION percentile ranks of each
+# component (E, P, T, C), not by raw sums. Raw scales are incomparable — E is
+# a sum of per-layer entropies that grows with depth/width, so raw sums
+# structurally favoured big models regardless of lambda; and a non-finite
+# component is penalised with the WORST rank instead of silently dropped
+# (V3's Sudoku pathology: unmeasured trainability could only help a model).
+# Weight of the complexity rank in the combined rank fitness:
+#   fitness = rank_E + rank_P + rank_T − LAMBDA_COMPLEXITY_RANK · rank_C
+LAMBDA_COMPLEXITY_RANK = 0.3
+
+
 # Weight of the complexity penalty -lambda_c*log(params) in the combined score.
 # Deliberately small: a tie-breaker toward lighter/faster models (we are time-
 # and hardware-limited), NOT a dominant pressure that shrinks architectures past
