@@ -18,7 +18,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .genotype import Genotype, sample_random_genotype, mutate
+from .genotype import Genotype, sample_random_genotype, mutate, phenotype_signature
 from .family import FamilyProfile
 from .repair import repair
 from .builder import build_model
@@ -123,6 +123,11 @@ def aging_evolution(
     population: List[Individual] = []
     start_time = time.time()
     seed_queue = [g.clone() for g in (seed_genotypes or [])]
+    # Phenotype-signature evaluation cache: different gene strings that build
+    # the SAME network reuse the cached proxy result instead of re-spending a
+    # build + dry-run + proxy evaluation. (Aging dynamics still get a fresh
+    # Individual — only the measurement is shared.)
+    eval_cache: dict = {}
 
     # ── Initialise population (curated seeds first, then random) ─────────────
     n_init_attempts = 0
@@ -145,11 +150,16 @@ def aging_evolution(
             )
         try:
             g = repair(g, C, H, W, num_classes, family)
-            model = build_model(g, C, H, W, num_classes, aniso_axis=family.aniso_axis)
-            # dry-run: catch any remaining shape errors before proxy eval
-            with torch.no_grad():
-                model.cpu()(torch.zeros(2, C, H, W))
-            fit   = proxy_fn(model, batch_x, device)
+            sig = phenotype_signature(g)
+            if sig in eval_cache:
+                fit = eval_cache[sig]
+            else:
+                model = build_model(g, C, H, W, num_classes, aniso_axis=family.aniso_axis)
+                # dry-run: catch any remaining shape errors before proxy eval
+                with torch.no_grad():
+                    model.cpu()(torch.zeros(2, C, H, W))
+                fit = proxy_fn(model, batch_x, device)
+                eval_cache[sig] = fit
         except Exception as e:
             logger.debug("Init arch failed: %s", e)
             continue
@@ -214,19 +224,24 @@ def aging_evolution(
         else:
             scale = 'small'
 
-        # mutate + repair + evaluate
+        # mutate + repair + evaluate (phenotype cache spares repeat builds)
         tries = 0
         while tries < 5:
             tries += 1
             child_g = mutate(parent.genotype, scale=scale)
             try:
                 child_g = repair(child_g, C, H, W, num_classes, family)
+                sig = phenotype_signature(child_g)
+                if sig in eval_cache:
+                    fit = eval_cache[sig]
+                    break
                 model   = build_model(child_g, C, H, W, num_classes,
                                       aniso_axis=family.aniso_axis)
                 # dry-run: catch any remaining shape errors before proxy eval
                 with torch.no_grad():
                     model.cpu()(torch.zeros(2, C, H, W))
                 fit     = proxy_fn(model, batch_x, device)
+                eval_cache[sig] = fit
                 break
             except Exception as e:
                 logger.debug("Mutation attempt %d failed: %s", tries, e)
@@ -266,9 +281,19 @@ def aging_evolution(
         # One consistent ranking over EVERYTHING evaluated during the search
         # (population + everything aged out). Nothing good can be lost to
         # aging eviction, so no separate global-best bookkeeping is needed.
+        # Deduped by built phenotype so downstream top-K is genuinely diverse.
         _rank_fitness(archive)
         archive.sort(key=lambda x: x.fitness, reverse=True)
-        return archive[:n_population]
+        seen, unique = set(), []
+        for ind in archive:
+            sig = phenotype_signature(ind.genotype)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            unique.append(ind)
+            if len(unique) >= n_population:
+                break
+        return unique
 
     population.sort(key=lambda x: x.fitness, reverse=True)
 

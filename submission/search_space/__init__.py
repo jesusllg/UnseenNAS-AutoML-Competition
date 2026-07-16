@@ -6,6 +6,7 @@ from .genotype import (
     DOWNSAMPLE_OPS, SKIP_MODES, NORM_TYPES, ACT_TYPES,
     MAX_STAGES, FIELD_CARDINALITY,
     sample_random_genotype, mutate, mutate_small, mutate_medium, mutate_large,
+    phenotype_signature,
 )
 from .family import FamilyProfile, infer_family
 from .block_library import BLOCK_REGISTRY
@@ -27,6 +28,7 @@ __all__ = [
     'DOWNSAMPLE_OPS', 'SKIP_MODES', 'NORM_TYPES', 'ACT_TYPES',
     'MAX_STAGES', 'FIELD_CARDINALITY',
     'sample_random_genotype', 'mutate', 'mutate_small', 'mutate_medium', 'mutate_large',
+    'phenotype_signature',
     # family
     'FamilyProfile', 'infer_family',
     # block

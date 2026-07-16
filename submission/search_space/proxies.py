@@ -67,7 +67,12 @@ def expressivity(model: nn.Module, batch_x: torch.Tensor,
     with torch.no_grad():
         feats = model.extract_layer_features(x)
     scores = [_expressivity_score(f) for f in feats]
-    return float(np.sum(scores)) if scores else -np.inf
+    # MEAN over layers, not sum: a per-layer entropy SUM grows monotonically
+    # with depth, so even after percentile ranking, rank_E degenerated into a
+    # depth ranking — a structural bias toward deeper nets independent of
+    # quality. The mean measures entropy per layer, comparable across depths.
+    expressivity.last_stats = {'layers': len(scores)}
+    return float(np.mean(scores)) if scores else -np.inf
 
 
 def progressivity(model: nn.Module, batch_x: torch.Tensor,
@@ -263,12 +268,20 @@ def az_nas_components(
         except Exception:
             return -np.inf
 
-    return {
+    comp = {
         'e': _safe(expressivity),
         'p': _safe(progressivity),
         't': _safe(trainability),
         'c': complexity_penalty(model),
     }
+    # Coverage counters (how much of the net each component actually saw) —
+    # extra keys are ignored by the rank combiner, but logged in reports so a
+    # future diagnosis doesn't have to guess like the V3 one did.
+    comp['e_layers']  = getattr(expressivity, 'last_stats', {}).get('layers', 0)
+    t_stats = getattr(trainability, 'last_stats', {})
+    comp['t_pairs']   = t_stats.get('pairs', 0)
+    comp['t_skipped'] = t_stats.get('skipped', 0)
+    return comp
 
 
 def az_nas_score_full(

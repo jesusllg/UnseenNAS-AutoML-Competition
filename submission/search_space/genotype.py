@@ -47,6 +47,38 @@ def stem_stride(stem_type: str) -> int:
     """Spatial stride a stem applies (the '_s2' variants halve H and W)."""
     return 2 if stem_type.endswith('_s2') else 1
 
+
+# Blocks whose construction actually reads the expansion gene
+_EXPANSION_BLOCKS = {'MBConvBlock', 'BottleneckBlock', 'ChannelMixingBlock'}
+
+
+def phenotype_signature(g: 'Genotype') -> str:
+    """
+    Canonical signature of the network a (repaired) genotype BUILDS.
+
+    Two different gene strings can decode to the same network: vestigial
+    stages beyond n_stages, skip_mode (never reaches the phenotype), expansion
+    on non-expanding blocks, group width on non-grouped blocks, SE ratio when
+    SE is off, kernel/dilation on attention blocks. Deduplication — before
+    spending proxy evaluations or rerank training — must therefore key on the
+    BUILT network, not on raw genes.
+    """
+    parts = [g.n_stages, g.stem_type, g.stem_channels, g.neck_type,
+             g.head_type, g.head_dropout, g.norm_type, g.act_type]
+    for s in g.active_stages:
+        p = [s.block_type, s.channels_idx, s.n_blocks, s.downsample,
+             s.drop_path_idx, s.se_enabled]
+        if s.se_enabled:
+            p.append(s.se_ratio_idx)
+        if s.block_type != 'LightAttentionBlock':
+            p += [s.kernel_idx, s.dilation_idx]
+        if s.block_type in _EXPANSION_BLOCKS:
+            p.append(s.expansion_idx)
+        if s.block_type == 'GroupedBottleneckBlock':
+            p.append(s.group_w_idx)
+        parts.append(tuple(p))
+    return repr(parts)
+
 # ── Cardinality map (for sampling / mutation) ──────────────────────────────────
 # NOTE: skip_mode is intentionally ABSENT. Every block in block_library.py
 # hardwires its own residual skip; the gene never reached the phenotype, so

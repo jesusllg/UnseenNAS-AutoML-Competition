@@ -70,21 +70,21 @@ TRAINABILITY_TOP_K    = 8    # how many top-fitness candidates to time-test
 
 
 # ── Supervised top-K reranking ────────────────────────────────────────────────
-# The proxy only FILTERS; the final pick is supervised. Val–test correlation
-# across the 13 practice datasets is ≈0.997, so a short real-training probe on
-# validation is a highly reliable selector of what will work on test — far
-# more reliable than any zero-cost signal. Each top candidate gets an
-# IDENTICAL micro-training (same optimizer/settings as the real Trainer),
-# then:  U = val_acc − β·log10(params) − γ·log10(epoch_s)
-# (val acc dominates; params/speed only break ties). Skipped in smoke mode
-# (falls back to the trainability gate).
-RERANK_TOP_K       = 10      # candidates short-trained (deduped, param-diverse)
-RERANK_BATCHES     = 150     # identical micro-training length per candidate
-RERANK_MAX_S       = 180.0   # per-candidate wall cap (seconds)
-RERANK_MAX_TOTAL_S = 1800.0  # whole-phase wall cap (seconds)
+# The proxy only FILTERS; the final pick is supervised. Pipeline per the fair-
+# comparison rules: (1) affordability gate first (cheap 2-step probe removes
+# models that can't converge in budget), (2) survivors get the SAME optimizer
+# steps over the SAME minibatch sequence (a dedicated seeded loader — global
+# reseeding alone does not reproduce loader order), (3) lexicographic pick:
+# highest early val acc; within RERANK_VAL_BAND of the best, prefer faster
+# epochs, then fewer params (scale-free, unlike a weighted utility).
+# The winner's short-trained weights are carried into final training (its
+# probe is a free warm start). Skipped in smoke mode (gate fallback).
+RERANK_TOP_K       = 10      # candidates probed (phenotype-deduped, param-diverse)
+RERANK_BATCHES     = 150     # identical optimizer steps per surviving candidate
+RERANK_MAX_S       = 180.0   # per-candidate wall ceiling (seconds)
+RERANK_MAX_TOTAL_S = 1800.0  # whole-phase deadline — always wins over per-candidate
 RERANK_VAL_MAX     = 2000    # max validation samples scored per candidate
-RERANK_BETA        = 0.01    # weight of log10(params) tie-breaker
-RERANK_GAMMA       = 0.01    # weight of log10(epoch_s) tie-breaker
+RERANK_VAL_BAND    = 0.005   # val ties within 0.5 pp resolved by speed, then params
 
 
 # ── NAS search (aging evolution) ──────────────────────────────────────────────

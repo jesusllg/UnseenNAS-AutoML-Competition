@@ -33,23 +33,20 @@ N_GENOTYPES = 100
 SEED = 0
 
 
-def main():
-    random.seed(SEED)
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-
-    fam = infer_family(C, H, W, N_CLS)
+def sample_rows(C, H, W, n_cls, n_genotypes, seed=SEED):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    fam = infer_family(C, H, W, n_cls)
     batch = torch.randn(16, C, H, W)
-
-    rows = []
-    tried = 0
-    while len(rows) < N_GENOTYPES and tried < N_GENOTYPES * 20:
+    rows, tried = [], 0
+    while len(rows) < n_genotypes and tried < n_genotypes * 20:
         tried += 1
         g = sample_random_genotype(preferred_blocks=fam.preferred_blocks,
                                    forbidden_blocks=fam.forbidden_blocks)
         try:
-            g = repair(g, C, H, W, N_CLS, fam)
-            m = build_model(g, C, H, W, N_CLS, aniso_axis=fam.aniso_axis)
+            g = repair(g, C, H, W, n_cls, fam)
+            m = build_model(g, C, H, W, n_cls, aniso_axis=fam.aniso_axis)
             with torch.no_grad():
                 m.cpu()(torch.zeros(2, C, H, W))
             comp = az_nas_score_full(m, batch, 'cpu')
@@ -59,10 +56,16 @@ def main():
         pooled = any(s.downsample != 'identity' for s in g.active_stages)
         rows.append({
             'pooled':   pooled,
+            't':        comp['trainability'],
             't_finite': bool(np.isfinite(comp['trainability'])),
             'pairs':    stats['pairs'],
             'skipped':  stats['skipped'],
         })
+    return fam, rows
+
+
+def main():
+    fam, rows = sample_rows(C, H, W, N_CLS, N_GENOTYPES)
 
     pooled    = [r for r in rows if r['pooled']]
     t_lost    = [r for r in pooled if not r['t_finite']]
@@ -79,9 +82,25 @@ def main():
     # transition pair — T was averaged over a different pair-subset per
     # architecture, leaving the most informative (downsampling) boundary
     # unmeasured on odd grids. Post-fix both counters must be ~zero.
-    healthy = frac_t_ok >= 0.95 and n_skip / max(n_pairs, 1) <= 0.02
-    print("RESULT:", "HEALTHY (full pair coverage)" if healthy
-          else "UNMEASURED PAIRS present (expected pre-fix)")
+    coverage_ok = frac_t_ok >= 0.95 and n_skip / max(n_pairs, 1) <= 0.02
+
+    # Distribution comparability: adaptive_avg_pool2d alignment (odd 9x9) is
+    # an APPROXIMATION of the PixelUnshuffle path (even 8x8) — T measured
+    # through it must live on the same scale, not just be finite.
+    _, rows8 = sample_rows(1, 8, 8, N_CLS, 40, seed=1)
+    t_odd  = np.array([r['t'] for r in rows  if r['t_finite']])
+    t_even = np.array([r['t'] for r in rows8 if r['t_finite']])
+    m_o, s_o = t_odd.mean(), t_odd.std()
+    m_e, s_e = t_even.mean(), t_even.std()
+    print(f"T dist  9x9 (adaptive-aligned): mean={m_o:.3f} std={s_o:.3f}"
+          f"   8x8 (PixelUnshuffle): mean={m_e:.3f} std={s_e:.3f}")
+    dist_ok = abs(m_o - m_e) <= 3 * max(s_o, s_e, 1e-3)
+    if not dist_ok:
+        print(">> T distributions diverge across alignment paths — recalibrate.")
+
+    healthy = coverage_ok and dist_ok
+    print("RESULT:", "HEALTHY (full coverage, comparable T scale)" if healthy
+          else "DEFECT present (expected pre-fix)")
     return 0 if healthy else 1
 
 
