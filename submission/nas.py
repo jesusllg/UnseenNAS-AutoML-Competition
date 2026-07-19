@@ -92,8 +92,9 @@ from config import (NAS_POPULATION, NAS_ROUNDS, NAS_TOURNAMENT, SEARCH_FRAC,
                     SMOKE_TIME_S, LOW_VRAM_MB,
                     MIN_AFFORDABLE_EPOCHS, TRAINABILITY_TOP_K,
                     LABEL_SMOOTHING, LABEL_SMOOTHING_MIN_CLASSES,
-                    RERANK_TOP_K, RERANK_BATCHES, RERANK_MAX_S,
-                    RERANK_MAX_TOTAL_S, RERANK_VAL_MAX, RERANK_VAL_BAND)
+                    RERANK_TOP_K, RERANK_BATCHES, RERANK_BATCHES_MAX,
+                    RERANK_MAX_S, RERANK_MAX_TOTAL_S, RERANK_VAL_MAX,
+                    RERANK_VAL_BAND)
 
 
 def _adaptive_search_params(remaining_s: float):
@@ -256,6 +257,11 @@ class NAS:
         # Falls back to the speed-only trainability gate in smoke mode.
         best = self._rerank_topk(population, family, in_c, H, W, n_cls,
                                  build_model)
+        # Hand the rerank runner-up to the Trainer (in-memory only, never
+        # written to any dataset file) for the second-shot mechanism.
+        ss = getattr(self, '_second_shot', None)
+        if ss is not None:
+            self.metadata['_second_shot'] = ss
 
         n_evaluated = len(population)
         search_elapsed = time.perf_counter() - t_search_start
@@ -366,6 +372,11 @@ class NAS:
         train_s_budget = split_budget(remaining)['train_s']
         steps = max(1, len(self.train_loader))
         bs    = getattr(self.train_loader, 'batch_size', None) or 32
+        # Probe length stretches toward ~one full epoch when the clock affords
+        # it: 150 fixed batches favoured fast-early learners and picked
+        # capacity-starved models on complex data (CIFARTile, V4 campaign).
+        # Still IDENTICAL for every candidate — fairness is preserved.
+        probe_steps = min(RERANK_BATCHES_MAX, max(RERANK_BATCHES, steps))
 
         # Candidate pool: best-first, PHENOTYPE-deduped (different gene
         # strings can build the same net), max 2 per log2-param bucket.
@@ -467,7 +478,7 @@ class NAS:
                     saw_batch = False
                     for x, y in _probe_loader():
                         saw_batch = True
-                        if nb >= RERANK_BATCHES or \
+                        if nb >= probe_steps or \
                            time.perf_counter() - t0 > cand_budget:
                             done = True
                             break
@@ -480,7 +491,7 @@ class NAS:
                         break
                 if nb == 0:
                     raise RuntimeError("no training batches ran")
-                complete = nb >= RERANK_BATCHES
+                complete = nb >= probe_steps
                 epoch_s  = (time.perf_counter() - t0) / nb * steps
 
                 model.eval()
@@ -530,6 +541,24 @@ class NAS:
                                         build_model)
         # Winner's short-trained weights → free warm start for final training.
         self._rerank_winner_state = best.pop('state', None)
+
+        # Runner-up (best of the remaining complete probes): handed to the
+        # Trainer through the IN-MEMORY metadata dict so the second-shot
+        # mechanism can reinvest idle clock into it if training ends early.
+        runner = None
+        for r in results:
+            if r is best or not r['complete']:
+                continue
+            if runner is None or _better(r, runner):
+                runner = r
+        if runner is not None:
+            self._second_shot = {
+                'genotype':   runner['ind'].genotype,
+                'aniso_axis': family.aniso_axis,
+                'val_probe':  runner['val'],
+                'params':     runner['params'],
+            }
+
         print(f"  NAS | rerank picked val={best['val']*100:.1f}%"
               f"  {best['params']/1e6:.2f}M  ~{best['epoch_s']:.0f}s/ep"
               f"  ({len(results)} probed, {len(survivors)} passed gate)")

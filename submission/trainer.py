@@ -22,6 +22,7 @@ from config import (
     LABEL_SMOOTHING, LABEL_SMOOTHING_MIN_CLASSES,
     ES_ENABLED, ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
     ES_DELTA_START, ES_DELTA_MIN, ES_DELTA_DECAY, ES_REGRESSION_DELTA,
+    ES_PATIENCE_MAX_MULT, SECOND_SHOT_MIN_S,
 )
 
 
@@ -53,10 +54,20 @@ class _EarlyStopper:
         self.plateau_wait     = 0   # plateau counter
         self.improve_count    = 0
 
-    def step(self, val_acc, epoch):
-        """Return (stop, zone_char) for logging."""
+    def step(self, val_acc, epoch, patience_mult: float = 1.0):
+        """
+        Return (stop, zone_char) for logging.
+
+        patience_mult stretches both patience thresholds — the Trainer passes
+        a clock-aware multiplier (×MAX while ≥50% of the dataset clock is
+        left, tapering to ×1) so early stopping is generous when hours remain
+        and strict when time is scarce.
+        """
         if not self.enabled or epoch < self.min_epochs:
             return False, '~'
+
+        eff_pat     = self.patience * max(1.0, patience_mult)
+        eff_plateau = self.plateau_patience * max(1.0, patience_mult)
 
         if val_acc > self.best + self.delta:
             self.best = val_acc
@@ -73,10 +84,10 @@ class _EarlyStopper:
         elif val_acc < self.best - self.regression_delta:
             self.wait += 1
             self.plateau_wait = 0
-            return self.wait >= self.patience, '↓'
+            return self.wait >= eff_pat, '↓'
         else:
             self.plateau_wait += 1
-            return self.plateau_wait >= self.plateau_patience, '~'
+            return self.plateau_wait >= eff_plateau, '~'
 
 
 class Trainer:
@@ -105,13 +116,133 @@ class Trainer:
             print(traceback.format_exc())
             return self.model
 
+    def _patience_mult(self) -> float:
+        """
+        Clock-aware early-stopping patience multiplier: ×ES_PATIENCE_MAX_MULT
+        while ≥50% of the dataset clock remains, tapering linearly to ×1 as
+        the clock is consumed. Short clocks are effectively unchanged.
+        """
+        tl = self.metadata.get('time_limit') if isinstance(self.metadata, dict) else None
+        total_s = float(tl) * 3600.0 if isinstance(tl, (int, float)) and tl > 0 \
+            else 0.5 * 3600.0
+        try:
+            frac_left = max(0.0, float(self.clock.check())) / total_s
+        except Exception:
+            return 1.0
+        return 1.0 + (ES_PATIENCE_MAX_MULT - 1.0) * min(1.0, frac_left / 0.5)
+
+    def _fit(self, model, deadline, tag=''):
+        """
+        Train ONE model until deadline / early stop. Restores its best weights
+        before returning. Reused by the main run and the second shot.
+        """
+        model.to(self.device)
+        self._micro_bs = None   # per-model OOM micro-batch state
+
+        n_cls = self.metadata['num_classes']
+        label_smoothing = LABEL_SMOOTHING if n_cls >= LABEL_SMOOTHING_MIN_CLASSES else 0.0
+
+        stopper = _EarlyStopper(ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
+                                ES_DELTA_START, ES_DELTA_MIN,
+                                ES_DELTA_DECAY, ES_REGRESSION_DELTA, ES_ENABLED)
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE,
+                                weight_decay=WEIGHT_DECAY)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX,
+                                                         eta_min=LR_ETA_MIN)
+        use_amp = torch.cuda.is_available()
+        # AMP tools resolved per torch version (2.x torch.amp / 1.10 cuda.amp)
+        self._autocast, scaler = make_amp_tools(use_amp)
+
+        best_acc, best_epoch, best_state = 0.0, 0, None
+        epoch_times: list = []
+        epoch, train_acc = 0, 0.0
+        stopped_early = False
+        self.model, _model_bak = model, self.model   # _forward_backward uses self.model
+
+        try:
+            while True:
+                t_left = deadline - time.perf_counter()
+                if t_left <= 0:
+                    print(f"  {tag}Time limit reached after {epoch} epochs.")
+                    break
+                if epoch_times:
+                    avg = sum(epoch_times[-3:]) / len(epoch_times[-3:])
+                    if avg > t_left * 0.9:
+                        print(f"  {tag}Stopping — ~{show_time(avg)}/epoch, {show_time(t_left)} left.")
+                        break
+
+                t0 = time.perf_counter()
+                model.train()
+                labels, preds = [], []
+                hit_deadline = False
+
+                for x, y in self.train_dl:
+                    # Mid-epoch deadline check: bounds clock overrun to one
+                    # batch instead of one epoch (the average-time guard can't
+                    # protect the FIRST epoch — no history yet).
+                    if time.perf_counter() >= deadline:
+                        hit_deadline = True
+                        break
+                    x, y = x.to(self.device), y.to(self.device)
+                    out = self._forward_backward(x, y, optimizer, criterion,
+                                                 scaler, use_amp)
+                    if self._xm is not None:
+                        self._xm.mark_step()
+                    labels += y[:out.size(0)].cpu().tolist()
+                    preds  += out.argmax(1).cpu().tolist()
+
+                scheduler.step()
+                epoch += 1
+                epoch_times.append(time.perf_counter() - t0)
+
+                if hit_deadline:
+                    print(f"  {tag}Time limit hit mid-epoch {epoch} — stopping with "
+                          f"{'best' if best_state is not None else 'current'} weights.")
+                    break
+
+                train_acc = accuracy_score(labels, preds)
+                val_acc   = self._evaluate(self.valid_dl)
+                lr_now    = scheduler.get_last_lr()[0]
+
+                if val_acc > best_acc:
+                    best_acc   = val_acc
+                    best_epoch = epoch
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+                mult = self._patience_mult()
+                stop, zone = stopper.step(val_acc, epoch, patience_mult=mult)
+                wait_str = f" ↓{stopper.wait}/{int(ES_PATIENCE*mult)}" if zone == '↓' else ""
+                print("  {}Epoch {:>3} | Train {:>6.2f}% | Val {:>6.2f}% | {} | lr {:.2e} {}{}".format(
+                    tag, epoch, train_acc * 100, val_acc * 100,
+                    show_time(epoch_times[-1]), lr_now, zone, wait_str))
+
+                if stop:
+                    saved = show_time(max(0.0, deadline - time.perf_counter()))
+                    reason = (f"plateau ~×{int(ES_PLATEAU_PATIENCE*mult)}" if zone == '~'
+                              else f"regression ↓>{ES_REGRESSION_DELTA*100:.1f}pp"
+                                   f" ×{int(ES_PATIENCE*mult)}")
+                    print(f"  {tag}Early stop at epoch {epoch} ({reason})."
+                          f" ~{saved} returned to pool.")
+                    stopped_early = True
+                    break
+        finally:
+            self.model = _model_bak
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            print(f"  {tag}← Restored best weights from epoch {best_epoch}"
+                  f" (val={best_acc*100:.2f}%)")
+
+        return {'best_acc': best_acc, 'best_epoch': best_epoch,
+                'has_best': best_state is not None, 'epochs': epoch,
+                'epoch_times': epoch_times, 'train_acc': train_acc,
+                'stopped_early': stopped_early}
+
     def _train(self):
         set_seeds(GLOBAL_SEED)
         # Start training with the NAS search phase's idle GPU memory reclaimed.
         free_gpu()
-        self.model.to(self.device)
-
-        weight_decay = WEIGHT_DECAY
 
         # Training budget: everything left on this dataset's clock (metadata
         # time_remaining and live clock reconciled conservatively) minus a
@@ -121,116 +252,70 @@ class Trainer:
         budget = split_budget(remaining)
         self._reserve_s = budget['reserve_s']
         train_budget    = budget['train_s']
-        deadline = time.perf_counter() + train_budget
-        t_train_start  = time.perf_counter()
-
-        # Early stopping (regression-based with dynamic improvement delta)
-        stopper = _EarlyStopper(ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
-                                ES_DELTA_START, ES_DELTA_MIN,
-                                ES_DELTA_DECAY, ES_REGRESSION_DELTA, ES_ENABLED)
-
-        n_cls = self.metadata['num_classes']
-        label_smoothing = LABEL_SMOOTHING if n_cls >= LABEL_SMOOTHING_MIN_CLASSES else 0.0
+        t_train_start   = time.perf_counter()
 
         es_desc = (f"δ↑{ES_DELTA_START:.4f}↘{ES_DELTA_MIN:.4f}/{ES_DELTA_DECAY} "
-                   f"↓{ES_REGRESSION_DELTA:.4f} p={ES_PATIENCE}/~{ES_PLATEAU_PATIENCE}") if ES_ENABLED else "off"
+                   f"↓{ES_REGRESSION_DELTA:.4f} p={ES_PATIENCE}/~{ES_PLATEAU_PATIENCE}"
+                   f"·adapt≤×{ES_PATIENCE_MAX_MULT:.0f}") if ES_ENABLED else "off"
         print(f"  Trainer | budget={show_time(train_budget)}"
               f" (predict reserve {show_time(self._reserve_s)})"
-              f" wd={weight_decay:.0e} | ES={es_desc} | device={self.device}")
+              f" wd={WEIGHT_DECAY:.0e} | ES={es_desc} | device={self.device}")
 
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        optimizer = optim.AdamW(self.model.parameters(), lr=LEARNING_RATE, weight_decay=weight_decay)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=LR_ETA_MIN)
+        fit1   = self._fit(self.model, time.perf_counter() + train_budget)
+        chosen, fit2 = fit1, None
 
-        use_amp = torch.cuda.is_available()
-        # AMP tools resolved per torch version (2.x torch.amp / 1.10 cuda.amp)
-        self._autocast, scaler = make_amp_tools(use_amp)
+        # ── Second shot: reinvest the idle clock into the rerank runner-up ────
+        # V4 evidence: early stopping routinely ended runs with hours unused;
+        # every regression was "small model picked + early exit + wasted time".
+        # If enough trainable time remains, fully train the runner-up and keep
+        # whichever model validates better. Uses ONLY otherwise-wasted time.
+        info = self.metadata.get('_second_shot')
+        idle = self.clock.check() - self._reserve_s
+        if info is not None and idle > SECOND_SHOT_MIN_S:
+            try:
+                from search_space import build_model
+                shape = self.metadata['input_shape']
+                print(f"  {'─'*55}")
+                print(f"  Second shot | {show_time(idle)} idle — training rerank"
+                      f" runner-up ({info.get('params', 0)/1e6:.2f}M,"
+                      f" probe val={info.get('val_probe', 0)*100:.1f}%)")
+                self.model.cpu()
+                free_gpu()
+                set_seeds(GLOBAL_SEED)
+                m2 = build_model(info['genotype'], shape[1], shape[2], shape[3],
+                                 self.metadata['num_classes'],
+                                 aniso_axis=info.get('aniso_axis'))
+                fit2 = self._fit(m2, time.perf_counter() +
+                                 (self.clock.check() - self._reserve_s), tag='[2nd] ')
+                if fit2['best_acc'] > fit1['best_acc']:
+                    print(f"  Second shot WINS: val {fit2['best_acc']*100:.2f}%"
+                          f" > {fit1['best_acc']*100:.2f}% — switching model.")
+                    self.model = m2
+                    chosen = fit2
+                else:
+                    print(f"  Second shot stays second: val {fit2['best_acc']*100:.2f}%"
+                          f" ≤ {fit1['best_acc']*100:.2f}% — first model stands.")
+                    del m2
+                    free_gpu()
+            except Exception as e:
+                print(f"  [Trainer] second shot failed (non-fatal): {e}")
+                free_gpu()
 
-        best_acc   = 0.0
-        best_epoch = 0
-        best_state = None
-        epoch_times: list[float] = []
-        epoch = 0
-        train_acc = 0.0   # last observed train accuracy (fallback for the report)
-        # Adaptive micro-batch: None = use the full batch. On OOM we halve it and
-        # accumulate gradients so the EFFECTIVE batch size never changes. Persists
-        # across epochs so we don't re-discover the limit every epoch.
-        self._micro_bs = None
+        self.model.to(self.device)
+        best_epoch  = chosen['best_epoch']
+        train_acc   = chosen['train_acc']
+        epoch       = fit1['epochs'] + (fit2['epochs'] if fit2 else 0)
+        epoch_times = chosen['epoch_times']
+        self._ss_summary = None if fit2 is None else {
+            'winner':     'second' if chosen is fit2 else 'first',
+            'first_val':  round(fit1['best_acc'], 4),
+            'second_val': round(fit2['best_acc'], 4),
+        }
 
-        while True:
-            t_left = deadline - time.perf_counter()
-            if t_left <= 0:
-                print(f"  Time limit reached after {epoch} epochs.")
-                break
-            if epoch_times:
-                avg = sum(epoch_times[-3:]) / len(epoch_times[-3:])
-                if avg > t_left * 0.9:
-                    print(f"  Stopping — ~{show_time(avg)}/epoch, {show_time(t_left)} left.")
-                    break
-
-            t0 = time.perf_counter()
-            self.model.train()
-            labels, preds = [], []
-            hit_deadline = False
-
-            for x, y in self.train_dl:
-                # Mid-epoch deadline check. The average-epoch-time guard above
-                # cannot protect the FIRST epoch (no history yet), and a single
-                # epoch of a heavy dataset can exceed the whole training budget
-                # — overrunning the organiser's clock fails the dataset (-10).
-                # This bounds the overrun to one batch instead of one epoch;
-                # the optimizer steps taken so far still count.
-                if time.perf_counter() >= deadline:
-                    hit_deadline = True
-                    break
-                x, y = x.to(self.device), y.to(self.device)
-
-                out = self._forward_backward(x, y, optimizer, criterion,
-                                             scaler, use_amp)
-
-                if self._xm is not None:
-                    self._xm.mark_step()
-
-                labels += y[:out.size(0)].cpu().tolist()
-                preds  += out.argmax(1).cpu().tolist()
-
-            scheduler.step()
-            epoch += 1
-            epoch_times.append(time.perf_counter() - t0)
-
-            if hit_deadline:
-                print(f"  Time limit hit mid-epoch {epoch} — stopping with "
-                      f"{'best' if best_state is not None else 'current'} weights.")
-                break
-
-            train_acc = accuracy_score(labels, preds)
-            val_acc   = self._evaluate(self.valid_dl)
-            lr_now    = scheduler.get_last_lr()[0]
-
-            if val_acc > best_acc:
-                best_acc   = val_acc
-                best_epoch = epoch
-                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
-
-            stop, zone = stopper.step(val_acc, epoch)
-            wait_str = f" ↓{stopper.wait}/{ES_PATIENCE}" if zone == '↓' else ""
-            print("  Epoch {:>3} | Train {:>6.2f}% | Val {:>6.2f}% | {} | lr {:.2e} {}{}".format(
-                epoch, train_acc * 100, val_acc * 100,
-                show_time(epoch_times[-1]), lr_now, zone, wait_str))
-
-            if stop:
-                saved = show_time(max(0.0, deadline - time.perf_counter()))
-                reason = (f"plateau ~×{ES_PLATEAU_PATIENCE}" if zone == '~'
-                          else f"regression ↓>{ES_REGRESSION_DELTA*100:.1f}pp ×{ES_PATIENCE}")
-                print(f"  Early stop at epoch {epoch} ({reason}). ~{saved} returned to pool.")
-                break
-
-        if best_state is not None:
-            self.model.load_state_dict(best_state)
-            print(f"  ← Restored best weights from epoch {best_epoch} (val={best_acc*100:.2f}%)")
+        if chosen['has_best']:
             # Re-evaluating the restored weights would reproduce best_acc by
             # construction (eval is deterministic) — don't spend a valid pass.
-            final_val_acc = best_acc
+            final_val_acc = chosen['best_acc']
         elif self.clock.check() - self._reserve_s > 0:
             final_val_acc = self._evaluate(self.valid_dl)
         else:
@@ -360,6 +445,7 @@ class Trainer:
             'train_s':          round(train_s, 1),
             'num_classes':      self.metadata.get('num_classes', '?'),
             'input_shape':      str(self.metadata.get('input_shape', '?')),
+            'second_shot':      json.dumps(getattr(self, '_ss_summary', None)),
         }
 
         pred_dir = Path('predictions')

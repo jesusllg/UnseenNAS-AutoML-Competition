@@ -80,11 +80,35 @@ TRAINABILITY_TOP_K    = 8    # how many top-fitness candidates to time-test
 # The winner's short-trained weights are carried into final training (its
 # probe is a free warm start). Skipped in smoke mode (gate fallback).
 RERANK_TOP_K       = 10      # candidates probed (phenotype-deduped, param-diverse)
-RERANK_BATCHES     = 150     # identical optimizer steps per surviving candidate
-RERANK_MAX_S       = 180.0   # per-candidate wall ceiling (seconds)
-RERANK_MAX_TOTAL_S = 1800.0  # whole-phase deadline — always wins over per-candidate
+RERANK_BATCHES     = 150     # minimum identical optimizer steps per candidate
+# V4 campaign evidence: 150 fixed batches favour fast-early learners — on
+# complex data (CIFARTile) that picked a 0.35M-param model that could not even
+# fit the train set. The probe now stretches toward ~one full epoch when the
+# clock affords it (still identical steps for every candidate).
+RERANK_BATCHES_MAX = 600     # probe ceiling: min(this, max(RERANK_BATCHES, steps/epoch))
+RERANK_MAX_S       = 450.0   # per-candidate wall ceiling (seconds)
+RERANK_MAX_TOTAL_S = 2700.0  # whole-phase deadline — always wins over per-candidate
 RERANK_VAL_MAX     = 2000    # max validation samples scored per candidate
 RERANK_VAL_BAND    = 0.005   # val ties within 0.5 pp resolved by speed, then params
+
+
+# ── Second shot (reinvest the idle clock) ─────────────────────────────────────
+# V4 campaign: median clock usage was 155 of ~480 min — early stopping ended
+# runs in minutes and the remaining hours were wasted. When training finishes
+# with at least this much trainable time left (beyond the predict reserve),
+# the Trainer fully trains the rerank RUNNER-UP and keeps whichever model
+# validates better. Costs only time that was previously thrown away, and
+# insures against the short-probe picking wrong (CIFARTile/Gutenberg/Cryptic).
+SECOND_SHOT_MIN_S = 3600.0   # fire only with ≥1 h of idle trainable time
+
+
+# ── Adaptive early-stopping patience ──────────────────────────────────────────
+# Base patience is calibrated for scarce time; with ~8 h per dataset, stopping
+# at minute 17 of 480 is never optimal. Patience scales with the fraction of
+# the dataset clock still remaining: ×MAX_MULT while ≥50% of the clock is
+# left, tapering linearly to ×1 as the clock is consumed. Short clocks are
+# unchanged (fraction is small from the start).
+ES_PATIENCE_MAX_MULT = 2.0
 
 
 # ── NAS search (aging evolution) ──────────────────────────────────────────────
