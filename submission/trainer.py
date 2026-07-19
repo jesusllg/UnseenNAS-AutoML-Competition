@@ -22,7 +22,7 @@ from config import (
     LABEL_SMOOTHING, LABEL_SMOOTHING_MIN_CLASSES,
     ES_ENABLED, ES_PATIENCE, ES_PLATEAU_PATIENCE, ES_MIN_EPOCHS,
     ES_DELTA_START, ES_DELTA_MIN, ES_DELTA_DECAY, ES_REGRESSION_DELTA,
-    ES_PATIENCE_MAX_MULT, SECOND_SHOT_MIN_S,
+    ES_PATIENCE_MAX_MULT, SECOND_SHOT_MIN_S, SECOND_SHOT_SKIP_VAL,
 )
 
 
@@ -271,7 +271,11 @@ class Trainer:
         # whichever model validates better. Uses ONLY otherwise-wasted time.
         info = self.metadata.get('_second_shot')
         idle = self.clock.check() - self._reserve_s
-        if info is not None and idle > SECOND_SHOT_MIN_S:
+        if info is not None and idle > SECOND_SHOT_MIN_S \
+                and fit1['best_acc'] >= SECOND_SHOT_SKIP_VAL:
+            print(f"  Second shot skipped — first model already at"
+                  f" {fit1['best_acc']*100:.2f}% val, nothing to gain.")
+        elif info is not None and idle > SECOND_SHOT_MIN_S:
             try:
                 from search_space import build_model
                 shape = self.metadata['input_shape']

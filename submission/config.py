@@ -99,7 +99,10 @@ RERANK_VAL_BAND    = 0.005   # val ties within 0.5 pp resolved by speed, then pa
 # the Trainer fully trains the rerank RUNNER-UP and keeps whichever model
 # validates better. Costs only time that was previously thrown away, and
 # insures against the short-probe picking wrong (CIFARTile/Gutenberg/Cryptic).
-SECOND_SHOT_MIN_S = 3600.0   # fire only with ≥1 h of idle trainable time
+SECOND_SHOT_MIN_S    = 3600.0  # fire only with ≥1 h of idle trainable time
+SECOND_SHOT_SKIP_VAL = 0.995   # first model already ~perfect → nothing to gain,
+                               # don't burn clock (V5: GameOfLife spent 3 h on a
+                               # dataset that was already at 100% validation)
 
 
 # ── Adaptive early-stopping patience ──────────────────────────────────────────
