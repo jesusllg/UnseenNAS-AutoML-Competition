@@ -277,6 +277,14 @@ def main():
     if args.total_time is not None:
         budget = GlobalTimeBudget(args.total_time, n_ds, args.min_time)
         per = args.total_time / n_ds
+        print("=" * 70)
+        print("  WARNING: --total-time is a SHARED pool across all datasets —")
+        print("  this is NOT the competition regime (each dataset has its OWN")
+        print("  fixed clock there). Early datasets can drain the pool and")
+        print(f"  starve later ones down to the --min-time floor ({args.min_time}h =")
+        print(f"  {args.min_time*60:.0f} min). For competition-representative results use")
+        print("  --time HOURS or a `time_limit` field in each dataset's metadata.")
+        print("=" * 70)
         print(f"Global budget: {args.total_time}h / {n_ds} datasets"
               f" = ~{per:.2f}h initial each (floor {args.min_time}h)")
 
@@ -287,6 +295,10 @@ def main():
         # are local-testing overrides.
         if budget is not None:
             hours = budget.next_allocation_h()
+            if hours <= args.min_time + 1e-9:
+                print(f"\n  WARNING: shared pool exhausted — {ds_path.name} gets only"
+                      f" the {args.min_time}h floor ({args.min_time*60:.0f} min)."
+                      f" Results will NOT be competition-representative.")
         elif args.time is not None:
             hours = args.time
         else:
