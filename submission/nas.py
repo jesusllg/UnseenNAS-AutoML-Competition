@@ -407,6 +407,12 @@ class NAS:
         # ── Stage 1: affordability gate (2-step timing probe) ────────────────
         survivors = []
         for ind in cands:
+            # Clock guard mirrors stage 2: never let the gate probes (up to
+            # RERANK_TOP_K build+backward passes) eat past the point where
+            # training time must be protected.
+            if get_safe_time_remaining(self.metadata, self.clock) < remaining * 0.5:
+                print("  NAS | rerank gate stopped early — protecting training time")
+                break
             try:
                 model = build_model(ind.genotype, in_c, H, W, n_cls,
                                     aniso_axis=family.aniso_axis).to(self.device)

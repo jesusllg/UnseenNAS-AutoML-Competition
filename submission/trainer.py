@@ -340,13 +340,21 @@ class Trainer:
 
         train_elapsed = time.perf_counter() - t_train_start
         # Artifacts are diagnostics only — an I/O failure must never fail the
-        # dataset, and saving must never eat into predict time.
+        # dataset, and saving must NEVER erode the predict reserve (main.py
+        # calls predict() next and relies on that reserve). Gate on slack
+        # ABOVE the full reserve: the report is a tiny JSON (a few seconds'
+        # slack is plenty); the model file is tens of MB, so require a whole
+        # extra reserve to remain intact after it.
+        slack = self.clock.check() - self._reserve_s
         try:
-            self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
+            if slack > 5.0:
+                self._save_report(epoch, final_train_acc, final_val_acc, train_elapsed)
+            else:
+                print("  (skipped report save — protecting predict reserve)")
         except Exception as e:
             print(f"  [Trainer] report save failed (non-fatal): {e}")
         try:
-            if self.clock.check() > self._reserve_s * 0.5:
+            if slack > self._reserve_s:
                 self._save_model()
             else:
                 print("  (skipped model save — protecting predict reserve)")
